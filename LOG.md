@@ -17,9 +17,16 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 ## Active variants
 
-- **`blocked_wy_b64`** (active best, canonical block size) — blocked Householder
-  QR with a compact-WY trailing update via batched GEMM; hybrid dispatch to
-  `torch.geqrf` for small n (<=256) or small batch (<16). Wins on the
+- **`cholqr2_recon`** (active best) — CholeskyQR (3 unshifted passes) for an
+  orthonormal Q + upper-triangular R, then BDGHKS modified-LU Householder
+  reconstruction to emit compact `(H, tau)`. Batched GEMM/Cholesky are far more
+  throughput-efficient than serialized panel `geqrf`. Hybrid dispatch to
+  `torch.geqrf` for small n (<=256) or small batch (<16). **New best on the
+  priority `b640 n512` (2.9x vs geqrf, 2.9x vs blocked_wy) and on n1024 (2.2x /
+  1.9x) and n352.** See iteration 5.
+- **`blocked_wy_b64`** (previous best, superseded on the big shapes) — blocked
+  Householder QR with a compact-WY trailing update via batched GEMM; hybrid
+  dispatch to `torch.geqrf` for small n (<=256) or small batch (<16). Wins on the
   large-n/large-batch shapes, especially the priority `b640 n512` (~1.9x). See
   iteration 2. Block size **64 confirmed** the best/tied-best choice by the
   iteration-4 sweep (b32/b64/b96/b128); the block-size question is closed.
@@ -43,6 +50,20 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 | b2_n4096_cond1  | 4096 |     2 |       80    |         91*    | geqrf  |
 
 *blocked_wy falls back to geqrf here (batch<16); small diffs are cross-GPU noise.
+
+Updated best per shape after iteration 5 (`cholqr2_recon`, 10 runs, GPU 5):
+
+| shape           |    n | batch | torch.geqrf | blocked_wy_b64 | cholqr2_recon | best      |
+|-----------------|-----:|------:|------------:|---------------:|--------------:|-----------|
+| b20_n32_cond1   |   32 |    20 |        0.12 |          0.12  |         0.12  | tie       |
+| b40_n176_cond1  |  176 |    40 |        1.4  |          1.63  |         1.51  | geqrf     |
+| b40_n352_cond1  |  352 |    40 |      102    |         75.3   |        72.3  | **cqr2r** |
+| b640_n512_cond2 |  512 |   640 |     2572    |       1381     |       475.8  | **cqr2r** |
+| b60_n1024_cond2 | 1024 |    60 |      523    |        451     |       233.1  | **cqr2r** |
+| b8_n2048_cond1  | 2048 |     8 |      151    |        173*    |       150.8+ | geqrf     |
+| b2_n4096_cond1  | 4096 |     2 |       80    |         91*    |        79.4+ | geqrf     |
+
++`cholqr2_recon` also falls back to geqrf here (batch<16), so it matches baseline.
 
 ## Iteration 1 — `blocked_hh_b64` (blocked/panel Householder QR)
 
@@ -129,3 +150,53 @@ directions worth exploring as separate variants:
   block-size tuning direction is **closed** — no further sweep points warranted.
   Next levers are structural (custom batched panel kernel, CholeskyQR2), not
   block size.
+
+## Iteration 5 — `cholqr2_recon` (CholeskyQR + Householder reconstruction)
+
+- Branch: `variant/cholqr2-recon` (merged to `main`).
+- Idea: replace the serialized panel `geqrf` entirely. Get Q (orthonormal) and R
+  from **CholeskyQR** (batched GEMM `G=A^T A` + Cholesky + triangular solve), then
+  **reconstruct genuine compact Householder `(H, tau)` from Q** so the geqrf
+  contract still holds. Reconstruction = BDGHKS modified LU (Ballard, Demmel,
+  Grigori, Jacquelin, Nguyen, Solomonik, *Reconstructing Householder vectors from
+  Tall-Skinny QR*, JPDC 2015; also LAPACK `?orhr_col` / `?launhr_col_getrfnp`):
+  for orthonormal Q, `Q - S = L U` (LU without pivoting) where `S` is the diagonal
+  sign matrix `S_ii = -sign(schur diag)`. Then the Householder vectors are `Y = L`
+  (unit-lower, stored below the diagonal of H), and `tau_i = |U_ii| ∈ [1,2]`.
+  `householder_product(H,tau)` reproduces `Q·diag(s)`, so we store
+  `triu(H) = diag(s)·(Q^T A)`.
+- Correctness: **reconstruction achieves both gates with wide margin** on every
+  benchmark shape and the full stress suite. On the benchmark inputs, factor
+  residual ≤ ~1.4e-6 (thresholds 8e-5…1e-2) and orthogonality ≤ ~1.1e-4
+  (thresholds 4e-4…5e-2). The de-risk 64×64 prototype passed first
+  (factor 1.7e-7, orth 8e-6), confirming the sign/`tau` conventions before batched
+  integration.
+- Key numerical finding: the reconstruction needs Q to be **exactly** orthonormal.
+  A diagonal shift on the CholeskyQR re-orthogonalization passes leaves columns
+  slightly non-unit and the sign-based modified LU amplifies that catastrophically
+  (orth blew up to ~1.0). Fix: run the passes **unshifted** (3 passes needed to get
+  orthogonality under the gate at n≥512), use `cholesky_ex` (no raise), and add a
+  cheap **per-element orthonormality guard** that repairs any non-converged batch
+  element with `torch.geqrf` (the checker maxes over the batch, so one bad element
+  would sink the whole shape). This also makes the stress suite (rank-deficient,
+  near-collinear, clustered-scale, row-scaled, …) pass.
+- Environment workarounds (gfx950 / ROCm 7.2.4 batched-path bugs):
+  * batched `torch.linalg.cholesky` HIP-faults for **n>256** → blocked Cholesky
+    that only calls Cholesky on ≤256 diagonal blocks (GEMM/solve for the rest).
+  * `hipblasStrsmBatched` faults for large batch (fails ≥256, unstable >~160) →
+    batch-chunked triangular solve (`_trsm`, chunk 128).
+- Performance (10 runs, GPU 5), median ms — **new best** on the blocked-path shapes:
+  n352 72.3 (blocked_wy 75.3, geqrf 102); **b640 n512 475.8 (blocked_wy 1381 →
+  2.9x, geqrf 2572 → 5.4x)**; n1024 233.1 (blocked_wy 451 → 1.9x, geqrf 523 →
+  2.2x). Small n (≤256) and small batch (<16, i.e. n2048/n4096) dispatch to geqrf
+  and match baseline (never regress).
+- CholeskyQR-only headroom (R correctness only, no reconstruction), profiled:
+  b640 n512 ≈ 247 ms, b60 n1024 ≈ 57 ms — i.e. R alone is ~5.6x / ~9x faster than
+  geqrf, confirming the throughput headroom. The Householder reconstruction adds
+  the modified LU (~130–160 ms; its sequential per-column panel loop is the main
+  remaining cost) but the full factorization still wins comfortably.
+- Decision: **promote to active best** and merge to `main`. Next levers: speed up
+  the modified-LU reconstruction (its per-column inner loop dominates at large
+  batch — a more block/GEMM-heavy panel or a fused kernel), and possibly extend
+  the fast path to the small-batch large-n shapes (n2048/n4096) if a batched-safe
+  Cholesky path can be found there.
