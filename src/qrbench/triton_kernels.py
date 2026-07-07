@@ -439,3 +439,82 @@ def triu_inv_block(blocks: torch.Tensor):
         BLOCK=BLOCK,
     )
     return Ui
+
+
+# ---------------------------------------------------------------------------
+# Iteration 16: fused R-assembly of the modified-LU Householder reconstruction.
+#
+# The reconstruction tail forms the returned compact ``H`` from the modified-LU
+# packed factor ``B`` (Householder vectors in its strict lower triangle) and the
+# stored upper-triangular R = ``diag(s) (Q^T A)``:
+#
+#     R_stored = triu(s[:, None] * (Q^T A))
+#     H        = tril(B, -1) + R_stored
+#
+# In PyTorch this is a sign-scale + ``triu`` + ``tril`` + add, i.e. ~4 full n x n
+# memory passes and several temporaries. Since the strict-lower part of H comes
+# from B and the upper-incl-diagonal part from the (row-sign-scaled) ``Q^T A``,
+# the whole assembly is a single elementwise select. This kernel fuses it into
+# one pass (one program per (batch, row), whole matrix written once), reading
+# ``QtA`` (the kept ``Q^T A`` GEMM output), ``B`` and the per-row sign ``s``.
+# Bit-for-bit identical to the PyTorch assembly. See LOG.md iteration 16.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _assemble_recon_kernel(
+    QtA_ptr,      # (B, n, n) Q^T A (GEMM output)
+    B_ptr,        # (B, n, n) modified-LU packed factor (strict lower = L)
+    s_ptr,        # (B, n) per-column diagonal sign
+    H_ptr,        # (B, n, n) output compact H
+    n,
+    stride_qb, stride_qi, stride_qj,
+    stride_bb, stride_bi, stride_bj,
+    stride_sb, stride_si,
+    stride_hb, stride_hi, stride_hj,
+    BLOCK_N: tl.constexpr,
+):
+    """Assemble one row of ``H``: upper-incl-diag = s[i]*QtA, strict lower = B."""
+    pid = tl.program_id(0)
+    bidx = pid // n
+    i = pid % n
+    cols = tl.arange(0, BLOCK_N)
+    cmask = cols < n
+    sval = tl.load(s_ptr + bidx * stride_sb + i * stride_si)
+    q = tl.load(
+        QtA_ptr + bidx * stride_qb + i * stride_qi + cols * stride_qj,
+        mask=cmask, other=0.0,
+    )
+    bl = tl.load(
+        B_ptr + bidx * stride_bb + i * stride_bi + cols * stride_bj,
+        mask=cmask, other=0.0,
+    )
+    h = tl.where(cols >= i, sval * q, bl)
+    tl.store(
+        H_ptr + bidx * stride_hb + i * stride_hi + cols * stride_hj,
+        h, mask=cmask,
+    )
+
+
+def assemble_recon(QtA: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """Fused R-assembly: ``H = triu(s[:,None]*QtA) + tril(B,-1)`` in one pass.
+
+    ``QtA``: (batch, n, n) the ``Q^T A`` product. ``B``: (batch, n, n) modified-LU
+    packed factor (strict lower = Householder vectors). ``s``: (batch, n) sign.
+    Returns the compact ``H`` (batch, n, n), bit-identical to the PyTorch
+    ``torch.triu(s.unsqueeze(-1) * QtA) + torch.tril(B, -1)``.
+    """
+    b, n, n2 = QtA.shape
+    assert n == n2, "QtA must be square"
+    H = torch.empty_like(QtA)
+    BLOCK_N = triton.next_power_of_2(n)
+    grid = (b * n,)
+    _assemble_recon_kernel[grid](
+        QtA, B, s, H, n,
+        QtA.stride(0), QtA.stride(1), QtA.stride(2),
+        B.stride(0), B.stride(1), B.stride(2),
+        s.stride(0), s.stride(1),
+        H.stride(0), H.stride(1), H.stride(2),
+        BLOCK_N=BLOCK_N,
+    )
+    return H
