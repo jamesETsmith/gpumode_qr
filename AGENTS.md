@@ -12,6 +12,7 @@ The good folks at GPUMODE have set up a new challenge to improve the gpu kernels
     - Only run one benchmark at a time
 - Absolutely no network, node, or firmware info should ever be checked in.
 - Before committing any code, review these rules for compliance
+- Always run detached processes in case this session gets disconnected.
 
 
 ## Official Instructions
@@ -55,3 +56,12 @@ Each db results should be a single json file that contains the following:
 - benchmark results (a list with one element per benchmark shape)
   - do 10 runs for each benchmark shape
 
+## Research Loop
+
+LOOP FOREVER:
+1. Look at the current state of the code. Ensure that things are checked in locally
+2. Look at the current implementation strategies. Are there any new variants that we should try based on literature research or previous results? You can add one new variant per loop iteration.
+3. Implement new variants.
+4. Run the benchmarks on these new variants (one at a time) and update results db
+5. If a variant hasn't improved performance for 3 iterations, kill it and remove it from our list of actively developed variants. Update text records of what we've tried and why we killed it and what's been working well.
+6. Start the loop over.
