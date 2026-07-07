@@ -344,6 +344,113 @@ def _variant_style(impls: list[str]):
     return style
 
 
+def _shape_subtitle(runs: list[Run], shape_name: str) -> str:
+    """``n=.., batch=.., cond=..`` string for a shape (empty if unknown)."""
+    sr_example = next(
+        (r.shapes[shape_name] for r in runs if shape_name in r.shapes), None
+    )
+    if sr_example is None:
+        return ""
+    return f"n={sr_example.n}, batch={sr_example.batch}, cond={sr_example.cond}"
+
+
+def _draw_shape_axis(
+    ax,
+    runs: list[Run],
+    shape_name: str,
+    impls: list[str],
+    style: dict,
+    x_of_run: dict,
+    labels: list[str],
+    *,
+    label_fontsize: int = 6,
+    annotate_fontsize: int = 6,
+    marker_size: int = 7,
+) -> None:
+    """Draw a single shape's median_ms-over-runs series onto ``ax``.
+
+    Shared by the combined small-multiples figure and the per-shape figures so
+    both stay visually consistent (baseline dashed reference, per-point variant
+    annotations, and red-x correctness-failure markers).
+    """
+    # baseline reference line for this shape
+    base_vals = [
+        r.shapes[shape_name].median_ms
+        for r in runs
+        if r.impl == BASELINE_IMPL and shape_name in r.shapes
+    ]
+    if base_vals:
+        base = min(base_vals)
+        ax.axhline(
+            base,
+            color="0.35",
+            linestyle="--",
+            linewidth=1.0,
+            zorder=1,
+            label=f"{BASELINE_IMPL} ref ({base:.2g} ms)",
+        )
+
+    for impl in impls:
+        xs, ys, fail_x, fail_y = [], [], [], []
+        for r in runs:
+            if r.impl != impl or shape_name not in r.shapes:
+                continue
+            sr = r.shapes[shape_name]
+            xs.append(x_of_run[id(r)])
+            ys.append(sr.median_ms)
+            if not sr.passed:
+                fail_x.append(x_of_run[id(r)])
+                fail_y.append(sr.median_ms)
+        if not xs:
+            continue
+        st = style[impl]
+        ax.plot(
+            xs,
+            ys,
+            marker=st["marker"],
+            color=st["color"],
+            linestyle=st["linestyle"],
+            markersize=marker_size,
+            linewidth=1.4,
+            label=impl,
+            zorder=3,
+        )
+        # annotate each point with the variant name (compact)
+        for x, y in zip(xs, ys):
+            ax.annotate(
+                impl.replace("blocked_", "b_"),
+                (x, y),
+                textcoords="offset points",
+                xytext=(4, 5),
+                fontsize=annotate_fontsize,
+                color=st["color"],
+                zorder=4,
+            )
+        # mark correctness failures distinctly
+        if fail_x:
+            ax.scatter(
+                fail_x,
+                fail_y,
+                marker="x",
+                color="red",
+                s=110,
+                linewidths=2.2,
+                zorder=5,
+                label="FAIL correctness",
+            )
+
+    ax.set_yscale("log")
+    ax.set_ylabel("median (ms, log)", fontsize=8)
+    ax.set_xticks(range(len(runs)))
+    ax.set_xticklabels(labels, fontsize=label_fontsize, rotation=0)
+    ax.grid(True, which="both", axis="y", alpha=0.25)
+    ax.margins(x=0.08)
+    # de-duplicate legend entries
+    handles, lbls = ax.get_legend_handles_labels()
+    uniq = dict(zip(lbls, handles))
+    ax.legend(uniq.values(), uniq.keys(), fontsize=label_fontsize, loc="best")
+
+
 def plot_performance_over_time(runs: list[Run], out_path: Path) -> Path:
     """Small-multiples: per shape, median_ms (log-y) vs run/commit order."""
     import matplotlib
@@ -367,89 +474,11 @@ def plot_performance_over_time(runs: list[Run], out_path: Path) -> Path:
 
     for idx, shape_name in enumerate(shapes):
         ax = axes[idx // ncols][idx % ncols]
-        # baseline reference line for this shape
-        base_vals = [
-            r.shapes[shape_name].median_ms
-            for r in runs
-            if r.impl == BASELINE_IMPL and shape_name in r.shapes
-        ]
-        if base_vals:
-            base = min(base_vals)
-            ax.axhline(
-                base,
-                color="0.35",
-                linestyle="--",
-                linewidth=1.0,
-                zorder=1,
-                label=f"{BASELINE_IMPL} ref ({base:.2g} ms)",
-            )
-
-        for impl in impls:
-            xs, ys, fail_x, fail_y = [], [], [], []
-            for r in runs:
-                if r.impl != impl or shape_name not in r.shapes:
-                    continue
-                sr = r.shapes[shape_name]
-                xs.append(x_of_run[id(r)])
-                ys.append(sr.median_ms)
-                if not sr.passed:
-                    fail_x.append(x_of_run[id(r)])
-                    fail_y.append(sr.median_ms)
-            if not xs:
-                continue
-            st = style[impl]
-            ax.plot(
-                xs,
-                ys,
-                marker=st["marker"],
-                color=st["color"],
-                linestyle=st["linestyle"],
-                markersize=7,
-                linewidth=1.4,
-                label=impl,
-                zorder=3,
-            )
-            # annotate each point with the variant name (compact)
-            for x, y in zip(xs, ys):
-                ax.annotate(
-                    impl.replace("blocked_", "b_"),
-                    (x, y),
-                    textcoords="offset points",
-                    xytext=(4, 5),
-                    fontsize=6,
-                    color=st["color"],
-                    zorder=4,
-                )
-            # mark correctness failures distinctly
-            if fail_x:
-                ax.scatter(
-                    fail_x,
-                    fail_y,
-                    marker="x",
-                    color="red",
-                    s=110,
-                    linewidths=2.2,
-                    zorder=5,
-                    label="FAIL correctness",
-                )
-
-        sr_example = next(
-            (r.shapes[shape_name] for r in runs if shape_name in r.shapes), None
+        _draw_shape_axis(
+            ax, runs, shape_name, impls, style, x_of_run, labels
         )
-        subtitle = ""
-        if sr_example:
-            subtitle = f"n={sr_example.n}, batch={sr_example.batch}, cond={sr_example.cond}"
+        subtitle = _shape_subtitle(runs, shape_name)
         ax.set_title(f"{shape_name}\n{subtitle}", fontsize=9)
-        ax.set_yscale("log")
-        ax.set_ylabel("median (ms, log)", fontsize=8)
-        ax.set_xticks(range(len(runs)))
-        ax.set_xticklabels(labels, fontsize=6, rotation=0)
-        ax.grid(True, which="both", axis="y", alpha=0.25)
-        ax.margins(x=0.08)
-        # de-duplicate legend entries
-        handles, lbls = ax.get_legend_handles_labels()
-        uniq = dict(zip(lbls, handles))
-        ax.legend(uniq.values(), uniq.keys(), fontsize=6, loc="best")
 
     # hide unused axes
     for idx in range(len(shapes), nrows * ncols):
@@ -465,6 +494,58 @@ def plot_performance_over_time(runs: list[Run], out_path: Path) -> Path:
     fig.savefig(out_path, dpi=130)
     plt.close(fig)
     return out_path.resolve()
+
+
+def plot_performance_per_shape(runs: list[Run], plots_dir: Path) -> list[Path]:
+    """One standalone figure per benchmark shape.
+
+    Writes ``plots/perf_<shape_name>.png`` for each shape: median_ms on a log-y
+    axis versus chronological run/commit order, each variant a distinct
+    color+marker with a legend, ``torch_geqrf`` as a dashed baseline reference,
+    correctness failures marked with a red ``x``, and per-point variant
+    annotations. Returns the list of absolute PNG paths written.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    shapes = _shape_order(runs)
+    impls = sorted({r.impl for r in runs})
+    style = _variant_style(impls)
+
+    x_of_run = {id(r): i for i, r in enumerate(runs)}
+    labels = [f"{i}\n{r.date:%m-%d %H:%M}" for i, r in enumerate(runs)]
+
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for shape_name in shapes:
+        fig, ax = plt.subplots(figsize=(max(9.0, 0.7 * len(runs) + 3.0), 5.5))
+        _draw_shape_axis(
+            ax,
+            runs,
+            shape_name,
+            impls,
+            style,
+            x_of_run,
+            labels,
+            label_fontsize=8,
+            annotate_fontsize=7,
+            marker_size=8,
+        )
+        subtitle = _shape_subtitle(runs, shape_name)
+        ax.set_title(
+            f"{shape_name}  ({subtitle})\n"
+            "median runtime over runs (log-y, lower is better)",
+            fontsize=12,
+        )
+        ax.set_xlabel("run index (chronological / commit order)", fontsize=9)
+        fig.tight_layout()
+        out_path = plots_dir / f"perf_{shape_name}.png"
+        fig.savefig(out_path, dpi=130)
+        plt.close(fig)
+        written.append(out_path.resolve())
+    return written
 
 
 def plot_branch_history(runs: list[Run], dag: GitDag, out_path: Path) -> Path:
@@ -625,6 +706,9 @@ def generate_all(repo: str | Path) -> list[Path]:
         raise SystemExit(f"No results found under {db_dir}")
 
     written: list[Path] = []
+    # Primary output: one standalone figure per benchmark shape.
+    written.extend(plot_performance_per_shape(runs, plots_dir))
+    # Kept as an extra overview: the combined small-multiples grid.
     written.append(
         plot_performance_over_time(runs, plots_dir / "perf_over_time.png")
     )

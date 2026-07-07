@@ -61,15 +61,18 @@ Two figures visualize progress; plotting only needs **matplotlib** (no
 torch/GPU), so run it on the host — not in the ROCm container:
 
 ```bash
-# writes plots/perf_over_time.png and plots/branch_history.png
+# writes one plots/perf_<shape>.png per benchmark shape, plus
+# plots/perf_over_time.png (overview) and plots/branch_history.png
 uv run --with matplotlib python scripts/plot_results.py
 ```
 
-- `plots/perf_over_time.png` — small-multiples grid (one subplot per benchmark
-  shape) of `median_ms` on a log-y axis versus run/commit order. Variants are
-  distinguished by color/marker, points are annotated with the variant, the
-  `torch_geqrf` baseline is drawn as a dashed reference line, and correctness
-  failures are marked with a red `x`.
+- `plots/perf_<shape>.png` — one standalone figure per benchmark shape (e.g.
+  `plots/perf_b640_n512_cond2.png`) of `median_ms` on a log-y axis versus
+  run/commit order. Each variant gets a distinct color/marker with a legend,
+  points are annotated with the variant, the `torch_geqrf` baseline is drawn as
+  a dashed reference line, and correctness failures are marked with a red `x`.
+- `plots/perf_over_time.png` — the same data as a combined small-multiples grid
+  (one subplot per shape), kept as a quick at-a-glance overview.
 - `plots/branch_history.png` — the git DAG rendered as branch lanes over time
   (`main` on top, each `variant/<name>` in its own lane), with merge commits
   marked as diamonds and benchmark results overlaid on the commit that produced
