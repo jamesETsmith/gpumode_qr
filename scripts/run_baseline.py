@@ -19,7 +19,10 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import torch  # noqa: E402
 
 from qrbench import inputs, checker, bench, dbwrite  # noqa: E402
-from qrbench.reference import REGISTRY  # noqa: E402
+from qrbench.reference import REGISTRY as _REF_REGISTRY  # noqa: E402
+from qrbench.variants import VARIANTS as _VARIANTS  # noqa: E402
+
+REGISTRY = {**_REF_REGISTRY, **_VARIANTS}
 
 
 def run_correctness_stress(fn, device: str) -> list[dict]:
