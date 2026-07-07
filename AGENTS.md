@@ -9,7 +9,7 @@ The good folks at GPUMODE have set up a new challenge to improve the gpu kernels
     - Use feature branches for different research directions
     - After serveral iterations, we'll do head to head comparisons and the best one will be merged into main
     - Any code that gets benchmarked, must be checked in
-    - Only run one benchmark at a time
+    - Only run one benchmark at a time on a particular gpu. All of our experiments should run on a single gpu. Since we have access to multiple gpus, we can run multiple benchmarks in parallel.
 - Absolutely no network, node, or firmware info should ever be checked in.
 - Before committing any code, review these rules for compliance
 - Always run detached processes in case this session gets disconnected.
