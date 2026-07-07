@@ -590,6 +590,26 @@ VARIANTS: dict[str, QRImpl] = {
         use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
         shift=True, shift_coef=1.5,
     ),
+    # Iteration 13: identical to ``cholqr3_shift_recon_invlu`` but the fused
+    # blocked Cholesky gate is raised from n<=768 to n<=1024 so the n1024
+    # benchmark shape uses the custom right-looking blocked Cholesky (Triton
+    # diagonal-block factor+inverse, GEMM trailing) instead of falling back to
+    # the library blocked-256 Cholesky, which iteration-12 profiling showed
+    # dominates n1024 (~42 ms over the 3 shifted-CQR3 passes). Isolation at
+    # b60 n1024: fused Cholesky ~5.6 ms/call vs library ~12.9 ms/call (2.3x),
+    # residual 1.3e-7 (== library 1.0e-7), maxdiff vs library 1.1e-5 (FP32
+    # noise); the full 3-pass CholeskyQR drops 56 -> 30 ms. kblock stays 64
+    # (kblock 96/128 regress: larger next_pow2 register block). The Q-forming
+    # trsm is NOT extended above 768 (at n1024 fused trsm ~2.8 ms is a touch
+    # slower than the library ~2.7 ms, so n1024 keeps the library trsm — the
+    # 30.0 vs 30.8 ms measured difference). n<=256 / batch<16 (n2048/n4096)
+    # still dispatch to geqrf, so only n1024 changes. See LOG.md iteration 13.
+    "cholqr3_shift_recon_bign": make_cholqr_recon(
+        passes=2, lu_block=32, use_triton_modlu_inv=True,
+        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=1024,
+        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
+        shift=True, shift_coef=1.5,
+    ),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
     "blocked_wy_b96": make_blocked_wy(96),
