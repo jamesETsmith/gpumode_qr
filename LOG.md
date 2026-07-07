@@ -17,7 +17,20 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 ## Active variants
 
-- **`cholqr2_recon_blk`** (active best, iteration 6) — identical CholeskyQR +
+- **`cholqr2_recon_fused`** (active best, iteration 8) — identical CholeskyQR +
+  BDGHKS modified-LU numerics as `cholqr2_recon_blk` (2 unshifted passes, block
+  32), but the modified-LU Householder reconstruction's serial per-column loop is
+  replaced by a **fused Triton kernel** (gfx950). The reconstruction is
+  restructured as a right-looking blocked LU whose only sequential-over-columns
+  work is the `w x w` (w=32) diagonal-block factorization; that block is factored
+  by a Triton kernel with **one program per batch element** (whole batch in
+  parallel, the 32 column steps run in-register, no per-column launches). `L21`,
+  `U12` and the trailing update stay as batched trsm/GEMM. Removes the launch
+  overhead that dominated reconstruction at large n. **New best on all fused-path
+  shapes: b640 n512 294 ms (vs 316 blk → 1.07x, vs geqrf 2572 → 8.7x), n1024 89
+  ms (2.3x / 5.9x), n352 23 ms (3.1x / 4.4x).** Falls back to geqrf for n<=256 /
+  batch<16 (n2048/n4096), matching baseline. See iteration 8.
+- **`cholqr2_recon_blk`** (superseded by `_fused`, iteration 6) — identical CholeskyQR +
   BDGHKS modified-LU reconstruction as `cholqr2_recon`, but the modified-LU panel
   width is narrowed from 64 to **32** and CholeskyQR runs in **2** unshifted
   passes instead of 3. The modified-LU panel factorization cost scales with the
@@ -89,6 +102,87 @@ Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
 
 +`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
 matches baseline there (small diffs are cross-GPU / run noise).
+
+## Iteration 8 — `cholqr2_recon_fused` (fused Triton modified-LU kernel)
+
+- Branch: `variant/fused-kernel` (merged `--no-ff` into `main`).
+- Direction: replace the dominant *serial library primitive* in
+  `cholqr2_recon_blk` with a **custom batched GPU kernel** (one matrix/panel per
+  program) so the batch runs in parallel below the launch boundary.
+- **Triton works on gfx950** (ROCm 7.2.4): `triton 3.6.0+rocm7.2.4`. A trivial
+  add kernel and the custom modified-LU kernel both compile and run correctly.
+
+### 1. Wall-time profile of `cholqr2_recon_blk` (GPU 2, medians)
+
+Broke down the fast-path pipeline into components:
+
+| component (ms)          | b640 n512 | b60 n1024 |
+|-------------------------|----------:|----------:|
+| A^T A GEMM              |      1.6  |      1.2  |
+| CholeskyQR (2 passes)   |  **164**  |     37    |
+| — of which Cholesky×2   |     ~81   |    ~29    |
+| — of which trsm (form Q)|     ~77   |     ~5    |
+| modified-LU recon       |     73    |  **138**  |
+
+- **b640 n512**: CholeskyQR (batched Cholesky + trsm, serialized on gfx950)
+  dominates at ~164 ms; modified-LU is ~73 ms.
+- **b60 n1024**: the modified-LU reconstruction dominates at ~138 ms — it is a
+  serial per-column Python loop (`n` steps × several tiny batched ops) so it is
+  launch-overhead bound, worst at large n / small batch.
+- Chosen target: the **modified-LU reconstruction**. It is the single largest
+  component at n1024, the second largest at n512, and its cost is a pure serial
+  loop (highest-ROI, cleanest kernelization). The Cholesky/trsm primitives are
+  vendor-tuned per call and a full n×n one-matrix-per-workgroup kernel does not
+  fit LDS (256×256 fp32 = 256 KB ≫ 64 KB), so they are left for iteration 9.
+
+### 2. Kernel + integration
+
+- Restructured `_modified_lu` into `_modified_lu_fused`: a right-looking blocked
+  LU whose only sequential-over-columns work is the `w×w` (w=32) diagonal-block
+  factorization. That tiny block (1024 fp32, fits in registers) is factored by a
+  Triton kernel, **one program per batch element**, 32 in-register column steps,
+  no per-column launches. `L21 = A21 U11⁻¹`, `U12 = L11⁻¹ B12` and the trailing
+  update `-= L21 U12` stay as batched trsm/GEMM. Mathematically identical to the
+  reference (same L\U packing, same BDGHKS sign convention).
+- Isolation validation (before harness): sign vectors **exact**; packed-LU / tau
+  / reconstructed-Q max-abs error ≤ ~6e-6 across n∈{33,64,128,512,1024},
+  batch∈{1,4,60,640} — pure FP32 noise.
+
+### 3. Correctness (harness gates)
+
+- **PASS on all 7 benchmark shapes + the full stress suite.** Benchmark inputs:
+  factor residual ≤ 1.8e-6 (gate ≥ 7.6e-5), orthogonality ≤ 1.2e-4 (gate ≥
+  3.8e-4). b640 n512: factor 1.18e-6, orth 1.22e-4. Stress (dense cond1/4,
+  rank-deficient, near-rank-deficient, banded, row-scaled, near-collinear,
+  upper-triangular, clustered-scale at n=32/176/512) all PASS with wide margins.
+
+### 4. Performance (10 runs, clean head-to-head; fused GPU 5, blk GPU 7)
+
+| shape           |    n | batch |  geqrf | cholqr2_recon_blk | cholqr2_recon_fused | vs blk | vs geqrf |
+|-----------------|-----:|------:|-------:|------------------:|--------------------:|-------:|---------:|
+| b20_n32_cond1   |   32 |    20 |   0.12 |             0.118 |               0.120 | tie*   | tie*     |
+| b40_n176_cond1  |  176 |    40 |   1.4  |             1.641 |               1.503 | tie*   | tie*     |
+| b40_n352_cond1  |  352 |    40 | 102    |            71.3   |          **23.1**   | 3.1x   | 4.4x     |
+| b640_n512_cond2 |  512 |   640 |2572    |           316.2   |         **294.4**   | 1.07x  | **8.7x** |
+| b60_n1024_cond2 | 1024 |    60 | 523    |           206.1   |          **89.1**   | 2.3x   | 5.9x     |
+| b8_n2048_cond1  | 2048 |     8 | 151    |           159.3   |             149.1   | tie*   | tie*     |
+| b2_n4096_cond1  | 4096 |     2 |  80    |            84.2   |              79.4   | tie*   | tie*     |
+
+*n≤256 and batch<16 dispatch to `torch.geqrf` (identical code path); differences
+are cross-GPU / run noise.
+
+- The fused kernel eliminates the per-column launch overhead: n1024 reconstruction
+  drops so the whole factorization goes 206→89 ms (2.3x); n352 71→23 ms (3.1x).
+  b640 n512 improves modestly (316→294) because CholeskyQR (~164 ms) — not the
+  reconstruction — is the dominant term there.
+- **Faster or tied on every shape, no regressions** ⇒ promote.
+- Decision: **promote to active best, merge `--no-ff` into `main`.**
+- Next levers (iteration 9): the profile pinpoints **CholeskyQR (batched
+  Cholesky + trsm)** as the new dominant term for the priority b640 n512 shape
+  (~164 ms, serialized by rocSOLVER/rocBLAS on gfx950). A custom batched
+  Cholesky and/or triangular-solve kernel (panel-blocked so a panel fits LDS, one
+  matrix per workgroup) is the next structural lever, and could also unlock the
+  small-batch large-n shapes (n2048/n4096) that still fall back to geqrf.
 
 ## Iteration 1 — `blocked_hh_b64` (blocked/panel Householder QR)
 

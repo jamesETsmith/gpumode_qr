@@ -243,12 +243,54 @@ def _modified_lu(Q: torch.Tensor, block: int = 64):
     return B, s
 
 
+def _modified_lu_fused(Q: torch.Tensor, block: int = 32):
+    """Blocked modified LU (BDGHKS Algorithm 5), fused diagonal-block kernel.
+
+    Mathematically equivalent to ``_modified_lu`` but restructured as a
+    right-looking blocked LU: the only sequential-over-columns work is the
+    factorization of the ``w x w`` diagonal block, done by a Triton kernel (one
+    program per batch element, all batch factored in parallel with the ``w``
+    column steps run in-register, so no per-column kernel launches). ``L21``
+    (off-diagonal panel), ``U12`` (row panel) and the trailing update stay as
+    efficient batched trsm / GEMM.
+
+    Requires ``block <= 32`` (the Triton block is ``next_power_of_2(block)``).
+    Returns ``(B, s)`` with the same packed convention as ``_modified_lu``.
+    """
+    from .triton_kernels import modlu_block
+
+    b, n, _ = Q.shape
+    B = Q.clone()
+    s = torch.empty(b, n, device=Q.device, dtype=Q.dtype)
+
+    for k in range(0, n, block):
+        w = min(block, n - k)
+        blk = B[:, k:k + w, k:k + w].contiguous()
+        LU, s_blk = modlu_block(blk)
+        B[:, k:k + w, k:k + w] = LU
+        s[:, k:k + w] = s_blk
+        if k + w < n:
+            L11 = B[:, k:k + w, k:k + w]
+            U11 = torch.triu(L11)
+            # L21 = A21 @ U11^{-1}  (solve X U11 = A21, U11 upper)
+            A21 = B[:, k + w:, k:k + w].contiguous()
+            L21 = _trsm(U11, A21, upper=True, left=False)
+            B[:, k + w:, k:k + w] = L21
+            # U12 = L11^{-1} @ B12  (unit-lower left solve)
+            B12 = B[:, k:k + w, k + w:].contiguous()
+            U12 = _trsm(L11, B12, upper=False, left=True, unitriangular=True)
+            B[:, k:k + w, k + w:] = U12
+            B[:, k + w:, k + w:] = B[:, k + w:, k + w:] - L21 @ U12
+    return B, s
+
+
 def make_cholqr_recon(
     passes: int = 3,
     small_n: int = 256,
     min_batch: int = 16,
     chol_block: int = 256,
     lu_block: int = 64,
+    use_triton_modlu: bool = False,
 ) -> QRImpl:
     """CholeskyQR(k) + Householder reconstruction -> compact (H, tau).
 
@@ -277,7 +319,10 @@ def make_cholqr_recon(
             ortho_err = (Q.transpose(-2, -1) @ Q - eye).abs().amax(dim=(-2, -1))
             bad = ~torch.isfinite(ortho_err) | (ortho_err > 1e-4)
 
-            B, s = _modified_lu(Q, block=lu_block)
+            if use_triton_modlu:
+                B, s = _modified_lu_fused(Q, block=lu_block)
+            else:
+                B, s = _modified_lu(Q, block=lu_block)
             pivots = torch.diagonal(B, dim1=-2, dim2=-1)
             tau = pivots.abs()
             # Q_recon = householder_product(H,tau) = Q @ diag(s);
@@ -311,6 +356,16 @@ VARIANTS: dict[str, QRImpl] = {
     # bring orthonormality well under both the checker gate and the per-element
     # geqrf-repair guard on the benchmark + stress inputs (measured empirically).
     "cholqr2_recon_blk": make_cholqr_recon(passes=2, lu_block=32),
+    # Iteration 8: identical CholeskyQR + BDGHKS modified-LU numerics as
+    # ``cholqr2_recon_blk`` (2 passes, block 32), but the modified-LU
+    # reconstruction uses a fused Triton kernel for the sequential-over-columns
+    # diagonal-block factorization (one program per batch element). This removes
+    # the per-column Python launch overhead that dominates the reconstruction at
+    # large n / small batch, while keeping the efficient batched trsm/GEMM
+    # trailing updates. See LOG.md iteration 8.
+    "cholqr2_recon_fused": make_cholqr_recon(
+        passes=2, lu_block=32, use_triton_modlu=True
+    ),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
     "blocked_wy_b96": make_blocked_wy(96),
