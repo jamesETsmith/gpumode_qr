@@ -395,6 +395,46 @@ def _modified_lu_fused(Q: torch.Tensor, block: int = 32):
     return B, s
 
 
+def _modified_lu_fused_inv(Q: torch.Tensor, block: int = 32):
+    """Blocked modified LU (BDGHKS Algorithm 5), fully GEMM-based off-diagonals.
+
+    Identical math to ``_modified_lu_fused`` but the diagonal-block kernel also
+    returns ``L11^{-1}`` and ``U11^{-1}`` so the off-diagonal panel/row solves
+    become batched GEMMs instead of serialized library ``_trsm``:
+
+        L21 = A21 @ U11^{-1}        (was solve_triangular X U11 = A21)
+        U12 = L11^{-1} @ B12        (was unit-lower left solve L11 X = B12)
+
+    Iteration-12 profiling showed those two trsm calls per block were the
+    dominant reconstruction cost (~9 of ~18 ms at b640 n512). Requires
+    ``block <= 32`` (Triton block is ``next_power_of_2(block)``). Returns
+    ``(B, s)`` with the same packed convention as ``_modified_lu``.
+    """
+    from .triton_kernels import modlu_inv_block
+
+    b, n, _ = Q.shape
+    B = Q.clone()
+    s = torch.empty(b, n, device=Q.device, dtype=Q.dtype)
+
+    for k in range(0, n, block):
+        w = min(block, n - k)
+        blk = B[:, k:k + w, k:k + w].contiguous()
+        LU, s_blk, L11inv, U11inv = modlu_inv_block(blk)
+        B[:, k:k + w, k:k + w] = LU
+        s[:, k:k + w] = s_blk
+        if k + w < n:
+            # L21 = A21 @ U11^{-1}
+            A21 = B[:, k + w:, k:k + w].contiguous()
+            L21 = A21 @ U11inv
+            B[:, k + w:, k:k + w] = L21
+            # U12 = L11^{-1} @ B12
+            B12 = B[:, k:k + w, k + w:].contiguous()
+            U12 = L11inv @ B12
+            B[:, k:k + w, k + w:] = U12
+            B[:, k + w:, k + w:] = B[:, k + w:, k + w:] - L21 @ U12
+    return B, s
+
+
 def make_cholqr_recon(
     passes: int = 3,
     small_n: int = 256,
@@ -402,6 +442,7 @@ def make_cholqr_recon(
     chol_block: int = 256,
     lu_block: int = 64,
     use_triton_modlu: bool = False,
+    use_triton_modlu_inv: bool = False,
     use_triton_chol: bool = False,
     chol_kblock: int = 32,
     chol_fused_max_n: int = 1_000_000,
@@ -445,7 +486,9 @@ def make_cholqr_recon(
             ortho_err = (Q.transpose(-2, -1) @ Q - eye).abs().amax(dim=(-2, -1))
             bad = ~torch.isfinite(ortho_err) | (ortho_err > 1e-4)
 
-            if use_triton_modlu:
+            if use_triton_modlu_inv:
+                B, s = _modified_lu_fused_inv(Q, block=lu_block)
+            elif use_triton_modlu:
                 B, s = _modified_lu_fused(Q, block=lu_block)
             else:
                 B, s = _modified_lu(Q, block=lu_block)
@@ -530,6 +573,19 @@ VARIANTS: dict[str, QRImpl] = {
     # LOG.md iteration 11.
     "cholqr3_shift_recon": make_cholqr_recon(
         passes=2, lu_block=32, use_triton_modlu=True,
+        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
+        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
+        shift=True, shift_coef=1.5,
+    ),
+    # Iteration 12: identical to ``cholqr3_shift_recon`` but the modified-LU
+    # Householder reconstruction replaces its two per-block library ``_trsm``
+    # calls (the dominant reconstruction cost, ~9 of ~18 ms at b640 n512) with
+    # batched GEMMs, using diagonal-block triangular inverses (L11^{-1}, U11^{-1})
+    # computed in-register by the fused ``modlu_inv_block`` Triton kernel.
+    # Mathematically identical output; attacks the largest remaining compute
+    # component of the priority shape. See LOG.md iteration 12.
+    "cholqr3_shift_recon_invlu": make_cholqr_recon(
+        passes=2, lu_block=32, use_triton_modlu_inv=True,
         use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
         use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
         shift=True, shift_coef=1.5,

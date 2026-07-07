@@ -106,6 +106,148 @@ def modlu_block(blocks: torch.Tensor):
 
 
 # ---------------------------------------------------------------------------
+# Iteration 12: modified-LU of a small block *plus* the diagonal-block
+# triangular inverses, so the reconstruction's off-diagonal panel/row solves
+# become batched GEMMs instead of serialized library trsm.
+#
+# Iteration-12 profiling of ``cholqr3_shift_recon`` showed the modified-LU
+# reconstruction (~18 ms at b640 n512) is dominated by two per-block library
+# ``_trsm`` calls (~9 ms) — the ``modlu_block`` kernels themselves are ~0.8 ms.
+# We fuse the diagonal-block inverses into the factorization kernel: after the
+# in-register modified-LU we also build ``L11^{-1}`` (unit lower) by row-forward
+# substitution and ``U11^{-1}`` (upper, pivot diagonal) by row-backward
+# substitution. The caller then forms ``L21 = A21 @ U11^{-1}`` and
+# ``U12 = L11^{-1} @ B12`` as batched GEMMs (throughput-friendly, whole batch in
+# parallel), mathematically identical to the trsm path. See LOG.md iteration 12.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _modlu_inv_block_kernel(
+    A_ptr,        # (B, w, w) diagonal blocks, factored in place
+    s_ptr,        # (B, w) output sign vector
+    Li_ptr,       # (B, w, w) L^{-1} (unit lower), output
+    Ui_ptr,       # (B, w, w) U^{-1} (upper, pivot diagonal), output
+    b,            # batch size
+    w,            # actual block width (<= BLOCK)
+    stride_ab, stride_ai, stride_aj,
+    stride_sb, stride_sj,
+    stride_lib, stride_lii, stride_lij,
+    stride_uib, stride_uii, stride_uij,
+    BLOCK: tl.constexpr,
+):
+    """Modified-LU of one ``w x w`` block + its diagonal triangular inverses.
+
+    Same modified-LU (no pivot, BDGHKS sign) as ``_modlu_block_kernel``; then
+    additionally emits ``L^{-1}`` (unit lower) and ``U^{-1}`` (upper, pivots on
+    the diagonal). Singular/degenerate blocks yield NaN/Inf which the caller's
+    per-element orthonormality guard detects and repairs with geqrf.
+    """
+    pid = tl.program_id(0)
+    if pid >= b:
+        return
+
+    rows = tl.arange(0, BLOCK)
+    cols = tl.arange(0, BLOCK)
+    rmask = rows < w
+    cmask = cols < w
+    tile_mask = rmask[:, None] & cmask[None, :]
+
+    base = A_ptr + pid * stride_ab
+    ptrs = base + rows[:, None] * stride_ai + cols[None, :] * stride_aj
+    tile = tl.load(ptrs, mask=tile_mask, other=0.0)
+
+    s_acc = tl.zeros((BLOCK,), dtype=tile.dtype)
+
+    for j in range(0, BLOCK):
+        if j < w:
+            is_j_col = cols == j
+            is_j_row = rows == j
+            d = tl.sum(tl.where(is_j_row[:, None] & is_j_col[None, :], tile, 0.0))
+            sj = tl.where(d >= 0, -1.0, 1.0)
+            piv = d - sj
+            s_acc = tl.where(rows == j, sj, s_acc)
+            tile = tl.where(is_j_row[:, None] & is_j_col[None, :], piv, tile)
+            col_div_mask = is_j_col[None, :] & (rows > j)[:, None]
+            tile = tl.where(col_div_mask, tile / piv, tile)
+            prow = tl.sum(tl.where(is_j_row[:, None], tile, 0.0), axis=0)
+            colj = tl.sum(tl.where(is_j_col[None, :], tile, 0.0), axis=1)
+            upd_mask = (rows > j)[:, None] & (cols > j)[None, :]
+            tile = tl.where(upd_mask, tile - colj[:, None] * prow[None, :], tile)
+
+    tl.store(ptrs, tile, mask=tile_mask)
+    s_ptrs = s_ptr + pid * stride_sb + cols * stride_sj
+    tl.store(s_ptrs, s_acc, mask=cmask)
+
+    # L^{-1} (unit lower): row-forward substitution, unit diagonal (no divide).
+    #   Linv[i, :] = e_i - sum_{k<i} L[i,k] * Linv[k, :]
+    Linv = tl.zeros((BLOCK, BLOCK), dtype=tile.dtype)
+    for i in range(0, BLOCK):
+        if i < w:
+            is_ir = rows == i
+            # strict-lower row of L (unit diagonal): keep cols < i
+            Lrow = tl.sum(
+                tl.where(is_ir[:, None] & (cols < i)[None, :], tile, 0.0), axis=0
+            )
+            contrib = tl.where((rows < i)[:, None], Lrow[:, None] * Linv, 0.0)
+            acc = tl.sum(contrib, axis=0)
+            ei = tl.where(cols == i, 1.0, 0.0)
+            rowval = ei - acc
+            Linv = tl.where(is_ir[:, None], rowval[None, :], Linv)
+    Linv = tl.where(cols[None, :] <= rows[:, None], Linv, 0.0)
+    Liptrs = Li_ptr + pid * stride_lib + rows[:, None] * stride_lii + cols[None, :] * stride_lij
+    tl.store(Liptrs, Linv, mask=tile_mask)
+
+    # U^{-1} (upper, pivot diagonal): row-backward substitution.
+    #   Uinv[i, :] = (e_i - sum_{k>i} U[i,k] * Uinv[k, :]) / U[i,i]
+    Uinv = tl.zeros((BLOCK, BLOCK), dtype=tile.dtype)
+    for ii in range(0, BLOCK):
+        i = BLOCK - 1 - ii
+        if i < w:
+            is_ir = rows == i
+            Urow = tl.sum(
+                tl.where(is_ir[:, None] & (cols >= i)[None, :], tile, 0.0), axis=0
+            )
+            contrib = tl.where((rows > i)[:, None], Urow[:, None] * Uinv, 0.0)
+            acc = tl.sum(contrib, axis=0)
+            Uii = tl.sum(tl.where(is_ir[:, None] & (cols == i)[None, :], tile, 0.0))
+            ei = tl.where(cols == i, 1.0, 0.0)
+            rowval = (ei - acc) / Uii
+            Uinv = tl.where(is_ir[:, None], rowval[None, :], Uinv)
+    Uinv = tl.where(cols[None, :] >= rows[:, None], Uinv, 0.0)
+    Uiptrs = Ui_ptr + pid * stride_uib + rows[:, None] * stride_uii + cols[None, :] * stride_uij
+    tl.store(Uiptrs, Uinv, mask=tile_mask)
+
+
+def modlu_inv_block(blocks: torch.Tensor):
+    """Modified-LU of ``w x w`` blocks + diagonal triangular inverses.
+
+    ``blocks``: (B, w, w) contiguous float32. Returns ``(LU, s, Linv, Uinv)``
+    where LU is the packed modified-LU factorization (same convention as
+    ``modlu_block``), ``s`` is the (B, w) per-column sign, ``Linv`` is the
+    inverse of the unit-lower factor and ``Uinv`` is the inverse of the upper
+    (pivot-diagonal) factor.
+    """
+    b, w, w2 = blocks.shape
+    assert w == w2, "blocks must be square"
+    BLOCK = triton.next_power_of_2(w)
+    LU = blocks.contiguous().clone()
+    s = torch.empty(b, w, device=blocks.device, dtype=blocks.dtype)
+    Linv = torch.empty_like(LU)
+    Uinv = torch.empty_like(LU)
+    grid = (b,)
+    _modlu_inv_block_kernel[grid](
+        LU, s, Linv, Uinv, b, w,
+        LU.stride(0), LU.stride(1), LU.stride(2),
+        s.stride(0), s.stride(1),
+        Linv.stride(0), Linv.stride(1), Linv.stride(2),
+        Uinv.stride(0), Uinv.stride(1), Uinv.stride(2),
+        BLOCK=BLOCK,
+    )
+    return LU, s, Linv, Uinv
+
+
+# ---------------------------------------------------------------------------
 # Iteration 9: batched Cholesky (+ inverse) of a small diagonal block.
 #
 # The CholeskyQR term dominates the priority ``b640 n512`` shape (~164 ms):
