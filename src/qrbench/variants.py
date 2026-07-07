@@ -12,6 +12,8 @@ from typing import Callable
 
 import torch
 
+from . import EPS32
+
 QRImpl = Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 
 
@@ -240,12 +242,24 @@ def _choleskyqr(
     use_triton_trsm: bool = False,
     trsm_kblock: int = 64,
     trsm_fused_max_n: int = 1_000_000,
+    shift: bool = False,
+    shift_coef: float = 11.0,
 ):
     """CholeskyQR with ``passes`` re-orthogonalizations (unshifted).
 
     Returns (Q, R) with A ~= Q R and Q numerically orthonormal. CholeskyQR2 is
     enough only for well-conditioned/small cases here; a third pass is needed to
     bring orthogonality under the gate for the larger benchmark shapes.
+
+    ``shift`` enables *shifted CholeskyQR3* (Fukaya, Nakatsukasa, Yanagisawa,
+    Yamamoto 2020): a single Cholesky pass on ``A^T A + s I`` (per-element shift
+    ``s = shift_coef * n * eps32 * max_i (A^T A)_ii``) is prepended to produce a
+    well-conditioned (not yet orthonormal) ``Q0`` even when ``A^T A`` is too
+    ill-conditioned for a plain FP32 Cholesky (which otherwise NaNs and forces
+    the caller's serialized ``geqrf`` repair). The ``passes`` subsequent
+    *unshifted* re-orthogonalizations then drive ``Q`` to exact orthonormality,
+    so the sign-based modified-LU reconstruction still applies. When
+    ``shift=False`` the routine is byte-for-byte the original CholeskyQR(passes).
     """
     # No diagonal shift: the Householder reconstruction requires Q to be
     # *exactly* orthonormal (a shift leaves the columns slightly non-unit, which
@@ -273,10 +287,22 @@ def _choleskyqr(
         return _trsm(Rup, B, upper=True, left=False)
 
     G = A.transpose(-2, -1) @ A
+    if shift:
+        # Per-element diagonal shift making G numerically SPD even for
+        # ill-conditioned A: s = shift_coef * n * eps * max_i G_ii (a cheap
+        # over-estimate of eps * ||G||_2). Then the two unshifted refinement
+        # passes remove the shift's bias and restore exact orthonormality.
+        diagG = torch.diagonal(G, dim1=-2, dim2=-1)
+        s = (shift_coef * n * EPS32) * diagG.amax(dim=-1)
+        idx = torch.arange(n, device=A.device)
+        G[:, idx, idx] += s.unsqueeze(-1)
     R = _chol(G).transpose(-2, -1)
     Q = _solve_q(R, A)
 
-    for _ in range(passes - 1):
+    # With a shifted first pass, run ``passes`` full unshifted refinements
+    # (shifted-CQR + CQR(passes)); otherwise the classic CQR(passes).
+    n_refine = passes if shift else passes - 1
+    for _ in range(n_refine):
         G = Q.transpose(-2, -1) @ Q
         Ri = _chol(G).transpose(-2, -1)
         Q = _solve_q(Ri, Q)
@@ -382,6 +408,8 @@ def make_cholqr_recon(
     use_triton_trsm: bool = False,
     trsm_kblock: int = 64,
     trsm_fused_max_n: int = 1_000_000,
+    shift: bool = False,
+    shift_coef: float = 11.0,
 ) -> QRImpl:
     """CholeskyQR(k) + Householder reconstruction -> compact (H, tau).
 
@@ -405,6 +433,7 @@ def make_cholqr_recon(
                 chol_fused_max_n=chol_fused_max_n,
                 use_triton_trsm=use_triton_trsm, trsm_kblock=trsm_kblock,
                 trsm_fused_max_n=trsm_fused_max_n,
+                shift=shift, shift_coef=shift_coef,
             )
 
             # Per-element guard: CholeskyQR can fail to produce an orthonormal Q
@@ -486,6 +515,24 @@ VARIANTS: dict[str, QRImpl] = {
         passes=2, lu_block=32, use_triton_modlu=True,
         use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
         use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
+    ),
+    # Iteration 11: identical fused pipeline as ``cholqr2_recon_fused3`` but the
+    # CholeskyQR2 is upgraded to *shifted CholeskyQR3*: a single Cholesky pass on
+    # ``A^T A + s I`` is prepended (per-element shift) so ill-conditioned dense
+    # benchmark elements (whose plain FP32 Cholesky NaNs) now converge to an
+    # orthonormal Q instead of falling back to a *serialized* ``torch.geqrf``
+    # repair. Profiling iteration 11 showed that geqrf repair — not the Cholesky,
+    # solve, GEMMs, or reconstruction — dominates the priority shapes (b640 n512:
+    # 156 of 202 ms repairing 36/640 NaN elements; n1024: 41 of 98 ms for 4/60).
+    # The two subsequent unshifted passes restore exact orthonormality so the
+    # modified-LU reconstruction is unchanged; the per-element geqrf guard stays
+    # for genuinely rank-deficient stress inputs (cheap, small batch). See
+    # LOG.md iteration 11.
+    "cholqr3_shift_recon": make_cholqr_recon(
+        passes=2, lu_block=32, use_triton_modlu=True,
+        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
+        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
+        shift=True, shift_coef=1.5,
     ),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
