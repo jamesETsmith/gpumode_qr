@@ -454,6 +454,7 @@ def make_cholqr_recon(
     batch_repair: bool = False,
     repair_passes: int = 3,
     repair_shift_coef: float = 3.0,
+    fused_assembly: bool = False,
 ) -> QRImpl:
     """CholeskyQR(k) + Householder reconstruction -> compact (H, tau).
 
@@ -477,9 +478,17 @@ def make_cholqr_recon(
         pivots = torch.diagonal(B, dim1=-2, dim2=-1)
         tau = pivots.abs()
         # Q_recon = householder_product(H,tau) = Q @ diag(s);
-        # R_stored = (Q diag(s))^T A = diag(s) (Q^T A).
-        R_stored = torch.triu(s.unsqueeze(-1) * (Q.transpose(-2, -1) @ A_))
-        H = torch.tril(B, -1) + R_stored
+        # R_stored = (Q diag(s))^T A = diag(s) (Q^T A). The kept Q^T A GEMM is
+        # load-bearing for the tight factor gate (the CholeskyQR-accumulated R
+        # would fail it), so we keep the GEMM and only fuse the sign-scale + triu
+        # + tril + add assembly (~4 full n x n memory passes) into one pass.
+        QtA = Q.transpose(-2, -1) @ A_
+        if fused_assembly:
+            from .triton_kernels import assemble_recon
+            H = assemble_recon(QtA, B, s)
+        else:
+            R_stored = torch.triu(s.unsqueeze(-1) * QtA)
+            H = torch.tril(B, -1) + R_stored
         return H, tau
 
     def impl(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -679,6 +688,24 @@ VARIANTS: dict[str, QRImpl] = {
         use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
         shift=True, shift_coef=1.5,
         batch_repair=True, repair_passes=3, repair_shift_coef=3.0,
+    ),
+    # Iteration 16: identical pipeline to ``cholqr3_shift_recon_batchfix`` (the
+    # active best) but the modified-LU Householder reconstruction's R-assembly
+    # (``R_stored = triu(s * (Q^T A)); H = tril(B,-1) + R_stored``) is fused into
+    # a single Triton pass (``assemble_recon``): one program per (batch, row)
+    # selects the row-sign-scaled ``Q^T A`` on/above the diagonal and the
+    # modified-LU packed ``B`` (Householder vectors) strictly below it, replacing
+    # the PyTorch sign-scale + ``triu`` + ``tril`` + add (~4 full n x n memory
+    # passes + temporaries) with one pass. The ``Q^T A`` GEMM is kept unchanged
+    # (it is load-bearing for the tight factor gate). Bit-for-bit identical
+    # output to ``_batchfix``. See LOG.md iteration 16.
+    "cholqr3_shift_recon_fusedasm": make_cholqr_recon(
+        passes=2, lu_block=32, use_triton_modlu_inv=True,
+        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=1024,
+        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
+        shift=True, shift_coef=1.5,
+        batch_repair=True, repair_passes=3, repair_shift_coef=3.0,
+        fused_assembly=True,
     ),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),

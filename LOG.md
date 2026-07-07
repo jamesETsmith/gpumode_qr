@@ -17,7 +17,22 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 ## Active variants
 
-- **`cholqr3_shift_recon_batchfix`** (active best, iteration 14) — identical
+- **`cholqr3_shift_recon_fusedasm`** (active best, iteration 16) — identical
+  pipeline to `cholqr3_shift_recon_batchfix` but the modified-LU Householder
+  reconstruction's **R-assembly** (`R_stored = triu(s*(Q^T A)); H = tril(B,-1) +
+  R_stored`) is **fused into a single Triton pass** (`assemble_recon`): one
+  program per (batch, row) selects the row-sign-scaled `Q^T A` on/above the
+  diagonal and the modified-LU packed `B` (Householder vectors) strictly below
+  it, replacing the PyTorch sign-scale + `triu` + `tril` + add (~4 full n×n
+  memory passes + temporaries) with one pass. The `Q^T A` GEMM is **kept
+  unchanged** — it is load-bearing for the tight factor gate (reusing the
+  CholeskyQR-accumulated R instead would raise the factor residual to the
+  orthogonality error ~1e-4 and fail). Output is **bit-for-bit identical** to
+  `_batchfix` on all 7 benchmark shapes + full stress. Same-GPU (5) 10/10:
+  **b640 n512 60.3 ms (vs 61.0 batchfix → 1.01x, vs geqrf 2572 → 42.6x); n1024
+  46.2 ms (vs 46.6); n352 8.16 ms (vs 8.30)**; geqrf-fallback shapes tied. See
+  iteration 16.
+- **`cholqr3_shift_recon_batchfix`** (superseded by `_fusedasm`, iteration 14) — identical
   pipeline to `cholqr3_shift_recon_bign` but the **serialized per-element
   `torch.geqrf` repair** of the residual non-converged elements is replaced by a
   **batched shifted-CholeskyQR sub-pipeline**. The `shift_coef=1.5` main pass
@@ -199,6 +214,111 @@ Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
 
 +`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
 matches baseline there (small diffs are cross-GPU / run noise).
+
+## Iteration 16 — `cholqr3_shift_recon_fusedasm` (fused modified-LU R-assembly)
+
+- Branch: `variant/recon-rassembly` (merged `--no-ff` into `main`).
+- Direction (single, bounded): cut the modified-LU reconstruction's R-assembly
+  at b640 n512 without changing the math or precision. The reconstruction tail
+  formed `R_stored = triu(s.unsqueeze(-1) * (Q^T A))` then
+  `H = torch.tril(B, -1) + R_stored` — a sign-scale + `triu` + `tril` + add,
+  i.e. ~4 full n×n memory passes and several temporaries.
+- (Prior iteration 15 — a mixed-precision first CholeskyQR pass, `cholqr3_mixed_recon`
+  — was explored on branch `variant/mixed-precision-first-pass` and **rejected /
+  not merged**: it passed both gates on all shapes but regressed b640 n512 ~1.15x
+  because the low-precision Gram inflated the batched-repair sub-batch and the
+  first-pass GEMM is not the bottleneck. So this iteration does **not** revisit
+  mixed precision; it attacks the FP32 assembly directly.)
+
+### 1. Fine profile of the R-assembly (GPU 2, medians, ms)
+
+Isolated the reconstruction tail on the real converged Q at each fast-path
+shape (the `Q^T A` GEMM measured separately from the sign-scale/triu/tril/add):
+
+| component (ms)                     | b640 n512 | b60 n1024 | b40 n352 |
+|------------------------------------|----------:|----------:|---------:|
+| modified-LU recon kernel (modlu_inv)|     9.05  |     8.85  |    2.26  |
+| `Q^T A` GEMM (kept)                |     1.55  |     1.10  |    0.06  |
+| **PyTorch assembly** (triu+tril+add) | **1.47**|   **0.55**|  **0.05**|
+| — cand: `torch.where(mask)`        |     0.69  |     0.27  |    0.03  |
+| — **cand: fused Triton `assemble_recon`** | **0.41** | **0.17** | **0.01** |
+
+- The `Q^T A` GEMM (~1.55 ms) is **load-bearing**: it produces the returned
+  `triu(H)`, and the factor gate measures `||triu(H) − (Q diag(s))^T A||`. Using
+  the CholeskyQR-accumulated `R` instead of recomputing `Q^T A` would make the
+  factor residual equal `||(I − Q^T Q) R||` ≈ the orthogonality error (~1e-4),
+  well over the ~7.6e-5 bench gate → it must stay. So only the **assembly** is
+  fusable (~1.47 ms at n512, the largest fusable slice).
+- A single fused Triton pass (`assemble_recon`: one program per (batch, row),
+  `H[i,:] = cols>=i ? s[i]*QtA[i,:] : B[i,:]`) drops the assembly from **1.47 →
+  0.41 ms at n512** (0.55 → 0.17 at n1024), ~1 memory pass vs ~4. Bit-exact.
+
+### 2. Change (reuses all existing passing numerics; bit-identical output)
+
+- New `assemble_recon` Triton kernel + helper in `triton_kernels.py`, gated by a
+  new `fused_assembly` flag threaded through `make_cholqr_recon`/`_reconstruct`.
+  The `Q^T A` GEMM is factored out and kept; when `fused_assembly=True` the
+  sign-scale + `triu` + `tril` + add is replaced by the one-pass kernel.
+- New variant `cholqr3_shift_recon_fusedasm` = `_batchfix` + `fused_assembly=True`
+  (everything else byte-for-byte identical).
+
+### 3. Correctness — bit-for-bit identical + both gates PASS
+
+- **Isolation:** `(H, tau)` **exactly equal** (maxdiff 0.000e+00) to `_batchfix`
+  on b40 n352 / b640 n512 / b60 n1024 **and every stress case** at n=32/176/512
+  (dense cond1/4, rank-deficient, near-rank-deficient, banded, row-scaled,
+  near-collinear, upper-triangular, clustered-scale). The fusion is a pure
+  memory-layout change, so this is expected and verified.
+- **Harness: PASS on all 7 benchmark shapes + the full stress suite.** b640 n512
+  factor 1.17e-6, orth 1.07e-4 (identical to `_batchfix`); b60 n1024 factor
+  1.98e-6, orth 1.17e-4. All stress danger cases hold with wide margins.
+
+### 4. Performance (10 runs, same GPU 5 head-to-head; DB run on GPU 5)
+
+| shape           |    n | batch |  geqrf | cholqr3_shift_recon_batchfix | cholqr3_shift_recon_fusedasm | vs batchfix | vs geqrf |
+|-----------------|-----:|------:|-------:|-----------------------------:|-----------------------------:|------------:|---------:|
+| b20_n32_cond1   |   32 |    20 |   0.12 |                        0.119 |                        0.115 | tie*        | tie*     |
+| b40_n176_cond1  |  176 |    40 |   1.4  |                        1.524 |                        1.523 | tie*        | tie*     |
+| b40_n352_cond1  |  352 |    40 | 102    |                        8.297 |                    **8.162** | 1.02x       | 12.5x    |
+| b640_n512_cond2 |  512 |   640 |2572    |                       60.997 |                   **60.326** | **1.01x**   | **42.6x**|
+| b60_n1024_cond2 | 1024 |    60 | 523    |                       46.624 |                   **46.240** | 1.01x       | 11.3x    |
+| b8_n2048_cond1  | 2048 |     8 | 151    |                      150.544 |                      148.520 | tie*        | tie*     |
+| b2_n4096_cond1  | 4096 |     2 |  80    |                       79.500 |                       79.356 | tie*        | tie*     |
+
+*n<=256 and batch<16 dispatch to `torch.geqrf` (identical code path). A separate
+same-GPU-2 warmup-3/iters-3 head-to-head agreed (n512 61.9 vs 63.1, n1024 46.6
+vs 46.9, n352 8.26 vs 8.31 fusedasm/batchfix).
+
+- **Faster on all three compute-path shapes (n352/n512/n1024), tied on the geqrf
+  fallbacks, no regressions, bit-identical output** => promote, merge `--no-ff`.
+- Decision: **promote to active best.**
+- The absolute win is small (~0.7 ms at n512, ~1.1% of wall) because the
+  assembly was already only ~1.5 ms of the ~61 ms wall — this was a bounded
+  "shave the remaining fusable memory traffic" direction, and it delivered the
+  predicted ~1 ms with zero numerical risk.
+
+### 5. Recommendation for iteration 17 — diminishing returns; see meta note
+
+- With the R-assembly fused, the b640 n512 wall (~60 ms) is now dominated by two
+  irreducible-looking pieces: the **fused Cholesky (~18 ms over the 3
+  shifted-CQR3 passes)** and the **modified-LU recon kernel (~9 ms) + Q-solve +
+  the load-bearing GEMMs (`A^T A`, `Q^T A`, trailing) (~7 ms)**, plus the
+  **batched repair (~8 ms)**. None has an obvious 2x structural lever left in
+  FP32.
+- Honest read on headroom: ~16 iterations in and **~40x over the geqrf baseline
+  on the priority shape**; iterations 12→16 delivered 66→60 ms (~1.1x total,
+  ~1.5%/iter), sharply down from the 2–3x jumps of iterations 5–11. Remaining
+  components are vendor-GEMM-bound or launch-bound small kernels. Realistic
+  remaining upside on n512 is single-digit percent (a handful of ms). Candidate
+  levers, decreasing confidence: (a) shrink the **batched repair** (~8 ms to
+  re-run the full shifted-CQR + reconstruction on ~3 elements — a cheaper
+  targeted re-solve or folding into the main passes); (b) a **fused Gram+Cholesky**
+  that avoids the separate `A^T A` GEMM, or an auto-tuned fused-Cholesky block;
+  (c) the **n2048/n4096** shapes still dispatch to geqrf (untouched since iter 5)
+  — the largest *untested* opportunity, though low-weight and geqrf is already
+  competitive at batch<16. Given diminishing returns, iteration 17 should either
+  target the repair/small-batch frontier explicitly or the loop should be
+  considered near-converged on the priority shape.
 
 ## Iteration 14 — `cholqr3_shift_recon_batchfix` (batched repair, kills serialized geqrf)
 
