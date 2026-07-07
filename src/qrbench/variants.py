@@ -203,6 +203,33 @@ def _batched_cholesky_fused(G: torch.Tensor, block: int = 32) -> torch.Tensor:
     return torch.tril(M)
 
 
+def _trsm_right_upper_fused(R: torch.Tensor, A: torch.Tensor, block: int = 64):
+    """Solve ``X R = A`` for X (R upper-triangular) as a blocked right-solve.
+
+    Equivalent to ``torch.linalg.solve_triangular(R, A, upper=True, left=False)``
+    (i.e. ``X = A R^{-1}``), but avoids rocBLAS's batch-serialized trsm on
+    gfx950. Only sequential-over-blocks work is inverting each ``w x w`` diagonal
+    block via a Triton kernel (one program per batch element, whole batch in
+    parallel); the off-diagonal corrections and the ``@ R_jj^{-1}`` multiply are
+    batched GEMMs. Column-block forward sweep:
+
+        X_j = (A_j - X_{<j} R_{<j, j}) R_jj^{-1}
+    """
+    from .triton_kernels import triu_inv_block
+
+    b, n, _ = R.shape
+    X = torch.empty_like(A)
+    for j in range(0, n, block):
+        jw = min(block, n - j)
+        Rjj = R[:, j:j + jw, j:j + jw].contiguous()
+        Rinv = triu_inv_block(Rjj)
+        corr = A[:, :, j:j + jw]
+        if j > 0:
+            corr = corr - X[:, :, :j] @ R[:, :j, j:j + jw]
+        X[:, :, j:j + jw] = corr @ Rinv
+    return X
+
+
 def _choleskyqr(
     A: torch.Tensor,
     passes: int = 3,
@@ -210,6 +237,9 @@ def _choleskyqr(
     use_triton_chol: bool = False,
     chol_kblock: int = 32,
     chol_fused_max_n: int = 1_000_000,
+    use_triton_trsm: bool = False,
+    trsm_kblock: int = 64,
+    trsm_fused_max_n: int = 1_000_000,
 ):
     """CholeskyQR with ``passes`` re-orthogonalizations (unshifted).
 
@@ -229,20 +259,27 @@ def _choleskyqr(
     # that the library's coarse (block-256) blocking wins, so we gate on n.
     n = A.shape[-1]
     fused = use_triton_chol and n <= chol_fused_max_n
+    fused_trsm = use_triton_trsm and n <= trsm_fused_max_n
 
     def _chol(M):
         if fused:
             return _batched_cholesky_fused(M, block=chol_kblock)
         return _batched_cholesky(M, chol_block)
 
+    def _solve_q(Rup, B):
+        # X R = B (R upper) -> X = B R^{-1}
+        if fused_trsm:
+            return _trsm_right_upper_fused(Rup, B, block=trsm_kblock)
+        return _trsm(Rup, B, upper=True, left=False)
+
     G = A.transpose(-2, -1) @ A
     R = _chol(G).transpose(-2, -1)
-    Q = _trsm(R, A, upper=True, left=False)
+    Q = _solve_q(R, A)
 
     for _ in range(passes - 1):
         G = Q.transpose(-2, -1) @ Q
         Ri = _chol(G).transpose(-2, -1)
-        Q = _trsm(Ri, Q, upper=True, left=False)
+        Q = _solve_q(Ri, Q)
         R = Ri @ R
     return Q, R
 
@@ -342,6 +379,9 @@ def make_cholqr_recon(
     use_triton_chol: bool = False,
     chol_kblock: int = 32,
     chol_fused_max_n: int = 1_000_000,
+    use_triton_trsm: bool = False,
+    trsm_kblock: int = 64,
+    trsm_fused_max_n: int = 1_000_000,
 ) -> QRImpl:
     """CholeskyQR(k) + Householder reconstruction -> compact (H, tau).
 
@@ -363,6 +403,8 @@ def make_cholqr_recon(
                 A, passes=passes, chol_block=chol_block,
                 use_triton_chol=use_triton_chol, chol_kblock=chol_kblock,
                 chol_fused_max_n=chol_fused_max_n,
+                use_triton_trsm=use_triton_trsm, trsm_kblock=trsm_kblock,
+                trsm_fused_max_n=trsm_fused_max_n,
             )
 
             # Per-element guard: CholeskyQR can fail to produce an orthonormal Q
@@ -431,6 +473,19 @@ VARIANTS: dict[str, QRImpl] = {
     "cholqr2_recon_fused2": make_cholqr_recon(
         passes=2, lu_block=32, use_triton_modlu=True,
         use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
+    ),
+    # Iteration 10: identical to ``cholqr2_recon_fused2`` but the Q-forming
+    # triangular solve ``X R = A`` (X = A R^{-1}, R upper) across the two
+    # CholeskyQR2 passes is replaced by a blocked right-solve whose only
+    # per-block work is inverting the w x w upper-triangular diagonal block via a
+    # Triton kernel (one program per batch element), with the off-diagonal
+    # corrections + the R_jj^{-1} multiply as batched GEMMs. Attacks the rocBLAS
+    # batched-trsm serialization that dominates b640 n512 after iteration 9.
+    # See LOG.md iteration 10.
+    "cholqr2_recon_fused3": make_cholqr_recon(
+        passes=2, lu_block=32, use_triton_modlu=True,
+        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
+        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
     ),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
