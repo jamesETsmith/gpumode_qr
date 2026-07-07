@@ -55,6 +55,29 @@ GPU=2 scripts/run_detached.sh python -u scripts/run_baseline.py --impl torch_geq
 `scripts/in_container.sh` forwards the git commit and docker image into the
 container so the results DB has correct provenance.
 
+## Plots
+
+Two figures visualize progress; plotting only needs **matplotlib** (no
+torch/GPU), so run it on the host — not in the ROCm container:
+
+```bash
+# writes plots/perf_over_time.png and plots/branch_history.png
+uv run --with matplotlib python scripts/plot_results.py
+```
+
+- `plots/perf_over_time.png` — small-multiples grid (one subplot per benchmark
+  shape) of `median_ms` on a log-y axis versus run/commit order. Variants are
+  distinguished by color/marker, points are annotated with the variant, the
+  `torch_geqrf` baseline is drawn as a dashed reference line, and correctness
+  failures are marked with a red `x`.
+- `plots/branch_history.png` — the git DAG rendered as branch lanes over time
+  (`main` on top, each `variant/<name>` in its own lane), with merge commits
+  marked as diamonds and benchmark results overlaid on the commit that produced
+  them (labeled with impl + best per-shape speedup vs the baseline).
+
+PNGs are git-ignored (regenerable). The script prints the absolute saved paths
+and a short per-variant history summary when it finishes.
+
 ## Layout
 
 ```
