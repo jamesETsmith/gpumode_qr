@@ -26,24 +26,30 @@ FP64. Passing submissions are ranked by the geometric mean of per-shape runtime.
 
 ### Start the container
 
+The container exposes all GPUs; a single GPU is selected per run via
+`HIP_VISIBLE_DEVICES` (the helpers take a `GPU=N` env). This lets us run
+different variants in parallel on separate idle GPUs (one benchmark per GPU).
+
 ```bash
 docker run -d --name gpumode_qr \
   --device=/dev/kfd --device=/dev/dri \
   --security-opt seccomp=unconfined --group-add video --ipc=host \
-  -e HIP_VISIBLE_DEVICES=1 \
   -v "$PWD":/workspace -w /workspace \
   rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0 \
   sleep infinity
 ```
 
-> Note: set exactly one of `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES`.
-> Setting both double-filters the device list and hides all GPUs.
+> Note: set exactly one of `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` per
+> run. Setting both double-filters the device list and hides all GPUs.
 
 ## Run the baseline
 
 ```bash
-# writes db/<timestamp>_torch_geqrf.json
-scripts/in_container.sh python scripts/run_baseline.py --impl torch_geqrf --stress
+# writes db/<timestamp>_torch_geqrf.json (GPU=N selects an idle GPU)
+GPU=1 scripts/in_container.sh python scripts/run_baseline.py --impl torch_geqrf --stress
+
+# long runs: detached so they survive disconnects (logs/ is git-ignored)
+GPU=2 scripts/run_detached.sh python -u scripts/run_baseline.py --impl torch_geqrf --stress
 ```
 
 `scripts/in_container.sh` forwards the git commit and docker image into the
