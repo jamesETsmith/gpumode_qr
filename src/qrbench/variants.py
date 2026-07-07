@@ -451,6 +451,9 @@ def make_cholqr_recon(
     trsm_fused_max_n: int = 1_000_000,
     shift: bool = False,
     shift_coef: float = 11.0,
+    batch_repair: bool = False,
+    repair_passes: int = 3,
+    repair_shift_coef: float = 3.0,
 ) -> QRImpl:
     """CholeskyQR(k) + Householder reconstruction -> compact (H, tau).
 
@@ -485,6 +488,36 @@ def make_cholqr_recon(
             eye = torch.eye(n, device=A.device, dtype=A.dtype)
             ortho_err = (Q.transpose(-2, -1) @ Q - eye).abs().amax(dim=(-2, -1))
             bad = ~torch.isfinite(ortho_err) | (ortho_err > 1e-4)
+
+            # Batched repair of the non-converged elements (iteration 14).
+            # The shift_coef=1.5 main pass minimizes the *total* bad count, but
+            # the handful of residual bad are severely ill-conditioned
+            # (cond(A^T A) ~ 1e12-1e15 on the dense cond=2 benchmark) and their
+            # first shifted Cholesky still NaNs. Re-running shifted CholeskyQR on
+            # just those elements *as a batched sub-problem* with a larger shift
+            # (repair_shift_coef, default 3.0) and more refinement passes makes
+            # that first Cholesky positive-definite while the extra unshifted
+            # passes remove the larger shift's bias, driving Q to orthonormality
+            # (~8e-7). This replaces the serialized, host-synchronizing per-element
+            # ``torch.geqrf`` repair with a single batched sub-pipeline (no Python
+            # loop over elements). Genuinely rank-deficient stress inputs do not
+            # converge here and still fall through to the geqrf guard below.
+            if batch_repair and bad.any():
+                idx = torch.nonzero(bad, as_tuple=True)[0]
+                # The bad subbatch is tiny (a few elements), so the fused
+                # kernels' per-block launch overhead dominates; the library
+                # blocked Cholesky / chunked trsm are cheaper at this batch size.
+                Qsub, _ = _choleskyqr(
+                    A[idx], passes=repair_passes, chol_block=chol_block,
+                    use_triton_chol=False, use_triton_trsm=False,
+                    shift=True, shift_coef=repair_shift_coef,
+                )
+                oe_sub = (Qsub.transpose(-2, -1) @ Qsub - eye).abs().amax(dim=(-2, -1))
+                sub_bad = ~torch.isfinite(oe_sub) | (oe_sub > 1e-4)
+                Q = Q.clone()
+                Q[idx] = Qsub
+                bad = bad.clone()
+                bad[idx] = sub_bad
 
             if use_triton_modlu_inv:
                 B, s = _modified_lu_fused_inv(Q, block=lu_block)
@@ -609,6 +642,26 @@ VARIANTS: dict[str, QRImpl] = {
         use_triton_chol=True, chol_kblock=64, chol_fused_max_n=1024,
         use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
         shift=True, shift_coef=1.5,
+    ),
+    # Iteration 14: identical to ``cholqr3_shift_recon_bign`` but the residual
+    # non-converged (near-rank-deficient) elements are repaired by a *batched*
+    # shifted CholeskyQR sub-pipeline (gather the bad elements, re-run shifted
+    # CholeskyQR with a larger shift_coef=3.0 and 3 refinement passes, scatter
+    # back) instead of the serialized, host-synchronizing per-element
+    # ``torch.geqrf`` repair. Iteration-12/14 profiling showed that geqrf repair
+    # of the ~3 bad elements at b640 n512 costs ~14 ms (rocSOLVER serializes over
+    # the batch on gfx950). The larger repair shift makes the ill-conditioned
+    # elements' first Cholesky positive-definite (shift_coef=1.5 NaNs there) and
+    # the extra unshifted passes remove the bias -> Q orthonormal (~8e-7), so no
+    # geqrf is needed on the dense benchmark. The geqrf guard remains ONLY as a
+    # last resort for genuinely rank-deficient stress inputs (which do not
+    # converge under any finite shift). See LOG.md iteration 14.
+    "cholqr3_shift_recon_batchfix": make_cholqr_recon(
+        passes=2, lu_block=32, use_triton_modlu_inv=True,
+        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=1024,
+        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
+        shift=True, shift_coef=1.5,
+        batch_repair=True, repair_passes=3, repair_shift_coef=3.0,
     ),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
