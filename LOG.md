@@ -17,7 +17,25 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 ## Active variants
 
-- **`cholqr2_recon_fused3`** (active best, iteration 10) — identical to
+- **`cholqr3_shift_recon`** (active best, iteration 11) — identical fused
+  pipeline as `cholqr2_recon_fused3` (2 unshifted passes, fused Triton
+  Cholesky/Q-solve gated to n<=768, fused modified-LU reconstruction) but the
+  CholeskyQR2 is upgraded to **shifted CholeskyQR3** (Fukaya, Nakatsukasa,
+  Yanagisawa, Yamamoto 2020). Iteration-11 profiling showed the true dominant
+  cost was not any kernel but the **serialized `torch.geqrf` repair** of
+  non-converged elements: at b640 n512, 156 of 202 ms repaired 36/640 elements
+  whose FP32 Cholesky of `A^T A` NaNs on the ill-conditioned dense cond=2 input;
+  at n1024, 41 of 98 ms for 4/60. A single prepended Cholesky pass on
+  `A^T A + sI` (per-element `s = 1.5 * n * eps * max_i (A^T A)_ii`) lets those
+  elements converge to an orthonormal Q; the two subsequent unshifted passes
+  restore exact orthonormality so the sign-based modified-LU reconstruction is
+  unchanged, and the per-element geqrf guard stays for genuinely rank-deficient
+  stress inputs. Benchmark bad-element count drops to ~3/640 (n512) and 0
+  (n1024/n352). **New best on the fast-path shapes: b640 n512 72.1 ms (vs 203.2
+  fused3 -> 2.82x, vs geqrf 2572 -> 35.7x), n1024 73.4 ms (vs 96.6 -> 1.32x),
+  n352 8.4 ms (vs 9.9 -> 1.17x).** Fallback shapes (n<=256, batch<16:
+  n2048/n4096) unchanged (identical geqrf dispatch). See iteration 11.
+- **`cholqr2_recon_fused3`** (superseded by `cholqr3_shift_recon`, iteration 10) — identical to
   `cholqr2_recon_fused2` but the CholeskyQR2 **Q-forming triangular solve**
   `X R = A` (`X = A R^{-1}`, R upper) across both passes is replaced by a custom
   **blocked right-solve that runs the batch in parallel**. Only per-block work is
@@ -131,6 +149,95 @@ Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
 
 +`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
 matches baseline there (small diffs are cross-GPU / run noise).
+
+## Iteration 11 — `cholqr3_shift_recon` (shifted CholeskyQR3, kills geqrf repair)
+
+- Branch: `variant/iter11` (merged `--no-ff` into `main`).
+- Direction (single, profile-driven): profile `cholqr2_recon_fused3` at b640 n512
+  and n1024, find the largest remaining component, attack it.
+
+### 1. Profile of `cholqr2_recon_fused3` (GPU 2, medians)
+
+Component breakdown of the *compute* pipeline (no fallback), plus the fallback:
+
+| component (ms)                     | b640 n512 | b60 n1024 |
+|------------------------------------|----------:|----------:|
+| A^T A + Q^T Q + Ri@R GEMMs         |      4.3  |      3.2  |
+| fused/library Cholesky (2 passes)  |     11.9  |     28.9  |
+| fused/library Q-solve (2 passes)   |      6.1  |      4.9  |
+| ortho guard                        |      2.2  |      1.6  |
+| modified-LU recon (modlu+R_stored) |     17.8  |     14.6  |
+| **pipeline compute subtotal**      |   **44**  |   **54**  |
+| **serialized `geqrf` repair**      |  **156**  |   **41**  |
+| — repairing N/batch elements       |   36/640  |     4/60  |
+| **full variant wall**              |  **202**  |   **98**  |
+
+- **The single dominant component is the `torch.geqrf` repair fallback**
+  (77% of wall at n512, 42% at n1024) — not the Cholesky, Q-solve, GEMMs, or
+  reconstruction. The "bad" elements produce a **NaN** Q: their FP32 Cholesky of
+  `A^T A` fails because the dense cond=2 benchmark input is ill-conditioned
+  enough (column scale range 100 -> cond(A^T A) ~ 1e7-1e8, near FP32 rank
+  deficiency). Extra unshifted passes do **not** help (they NaN at the first
+  Cholesky) — confirmed: 36 bad at both 2 and 3 passes.
+
+### 2. Fix: shifted CholeskyQR3
+
+- Prepend one Cholesky pass on `A^T A + sI` (per-element shift
+  `s = shift_coef * n * eps32 * max_i (A^T A)_ii`) so ill-conditioned elements
+  yield a well-conditioned (not-yet-orthonormal) `Q0`; the two subsequent
+  **unshifted** passes drive `Q` to exact orthonormality, so the modified-LU
+  Householder reconstruction (which needs an exactly orthonormal Q) is unchanged.
+  `shift=False` keeps all existing variants byte-identical.
+- **Coefficient sweep at b640 n512** (bad-element count; smaller shift ->
+  better-conditioned Q0, so smaller is better down to the PD floor): coef 0.5->3,
+  1.0->4, **1.5->3**, 2.0->9, 3.0->5, 11.0->16. End-to-end median (incl. repair)
+  bottoms out at coef 0.5/1.5 (~72 ms). Chose **shift_coef=1.5** (same best time,
+  a touch more conservative than 0.5). The ~3 residual bad are genuinely
+  FP32-rank-deficient (cond > ~1e8) and correctly keep the geqrf guard (cheap).
+- New variant `cholqr3_shift_recon = make_cholqr_recon(passes=2, lu_block=32,
+  use_triton_modlu=True, use_triton_chol=True, chol_kblock=64,
+  chol_fused_max_n=768, use_triton_trsm=True, trsm_kblock=64,
+  trsm_fused_max_n=768, shift=True, shift_coef=1.5)`.
+
+### 3. Correctness
+
+- Isolation: bad-element count b640 n512 36 -> 3, b60 n1024 4 -> 0, b40 n352
+  (already 0) unchanged; surviving Q orthonormality error <= 1.7e-6 (well under
+  the 1e-4 guard).
+- Harness: **PASS on all 7 benchmark shapes + the full stress suite.** b640 n512:
+  factor 1.15e-6 (gate 7.6e-5 bench / 1.22e-3 stress), orth 9.21e-5 (gate
+  3.8e-4). All stress cases (dense cond1/4, rank-deficient, near-rank-deficient,
+  banded, row-scaled, near-collinear, upper-triangular, clustered-scale at
+  n=32/176/512) PASS with wide margins (the rank-deficient / near-collinear
+  danger cases included).
+
+### 4. Performance (10 runs, same GPU 2 for a clean head-to-head)
+
+| shape           |    n | batch |  geqrf | cholqr2_recon_fused3 | cholqr3_shift_recon | vs fused3 | vs geqrf |
+|-----------------|-----:|------:|-------:|---------------------:|--------------------:|----------:|---------:|
+| b20_n32_cond1   |   32 |    20 |   0.12 |                0.121 |               0.121 | tie*      | tie*     |
+| b40_n176_cond1  |  176 |    40 |   1.4  |                1.641 |               1.630 | tie*      | tie*     |
+| b40_n352_cond1  |  352 |    40 | 102    |                9.854 |           **8.431** | 1.17x     | 12.1x    |
+| b640_n512_cond2 |  512 |   640 |2572    |              203.2   |          **72.1**   | **2.82x** | **35.7x**|
+| b60_n1024_cond2 | 1024 |    60 | 523    |               96.6   |           **73.4**  | 1.32x     | 7.1x     |
+| b8_n2048_cond1  | 2048 |     8 | 151    |              171.7   |             169.9   | tie*      | tie*     |
+| b2_n4096_cond1  | 4096 |     2 |  80    |               89.8   |              89.2   | tie*      | tie*     |
+
+*n<=256 and batch<16 dispatch to `torch.geqrf` (identical code path); the
+archived DB run put shift_recon on GPU 5 (n2048 read 182 ms) — cross-GPU noise:
+on the same GPU the two variants are within run noise on the fallback shapes.
+
+- **Faster or tied on every shape, no regressions** => promote, merge `--no-ff`.
+- Decision: **promote to active best.**
+- Next levers (iteration 12): the b640 n512 wall is now ~72 ms and the compute
+  pipeline (~44 ms) is the real floor — of which the **modified-LU
+  reconstruction (~18 ms)** and the **fused Cholesky (~12 ms over 2 passes)** are
+  the biggest pieces. Options: (a) fuse the R_stored `Q^T A` GEMM + assembly into
+  the reconstruction; (b) a **mixed-precision (BF16/FP16-input, FP32-accumulate)
+  A^T A / trailing GEMM** first CholeskyQR pass (the shift + unshifted refinement
+  now gives robustness headroom to tolerate a lower-precision first pass — but it
+  must stay within both gates on all shapes + full stress). Also still open: the
+  small-batch large-n shapes (n2048/n4096) that fall back to geqrf.
 
 ## Iteration 10 — `cholqr2_recon_fused3` (custom batched triangular solve)
 
