@@ -10,7 +10,6 @@ Timing methodology:
 
 from __future__ import annotations
 
-import math
 import statistics
 from dataclasses import dataclass, field
 from typing import Callable
@@ -75,10 +74,3 @@ def benchmark(
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))  # milliseconds
     return TimingResult(times_ms=times)
-
-
-def geomean(values: list[float]) -> float:
-    """Geometric mean used for the cross-shape ranking metric."""
-    if not values:
-        return float("nan")
-    return math.exp(sum(math.log(v) for v in values) / len(values))

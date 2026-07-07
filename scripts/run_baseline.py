@@ -63,8 +63,6 @@ def run_benchmarks(fn, device: str, warmup: int, iters: int) -> list[dict]:
             f"median={timing.median:.3f}ms min={timing.min:.3f}ms "
             f"factor={chk.factor_residual:.2e} orth={chk.orth_residual:.2e}"
         )
-    gm = bench.geomean([r["timing"]["median_ms"] for r in results])
-    print(f"[bench] geomean(median) across shapes = {gm:.4f} ms")
     return results
 
 
@@ -96,7 +94,6 @@ def main() -> int:
 
     all_pass = all(r["correctness"]["passed"] for r in bench_results)
     stress_pass = all(r["passed"] for r in stress_results) if stress_results else None
-    geomean_median = bench.geomean([r["timing"]["median_ms"] for r in bench_results])
 
     if not args.no_write:
         meta = dbwrite.collect_metadata(str(REPO_ROOT), args.docker_image)
@@ -111,7 +108,6 @@ def main() -> int:
                 "all_benchmarks_pass": all_pass,
                 "stress_pass": stress_pass,
                 "stress_results": stress_results,
-                "geomean_median_ms": geomean_median,
             },
         )
         print(f"wrote {path}")

@@ -56,7 +56,7 @@ src/qrbench/
   inputs.py     # benchmark shapes + stress-case generators (cond column scaling)
   checker.py    # FP64 correctness gates (factor residual, orthogonality)
   reference.py  # implementation registry; torch_geqrf baseline
-  bench.py      # HIP-event timing + geomean ranking metric
+  bench.py      # HIP-event timing (per-shape)
   dbwrite.py    # results DB writer (provenance + per-shape results)
 scripts/
   run_baseline.py   # correctness + benchmark + DB record
@@ -68,7 +68,9 @@ db/                 # one JSON per run (see AGENTS.md schema)
 
 Each `db/*.json` records: git commit, date, ROCm version, docker image, torch
 version, GPU name, and `benchmark_results` (one entry per shape, each with 10
-timed runs) plus a correctness summary and the geomean ranking metric.
+timed runs) plus a correctness summary. Timings are reported per shape; we do
+not roll them up into a single cross-shape number (the shapes are too different
+for that to be meaningful).
 
 ## Workflow
 
