@@ -302,6 +302,15 @@ def make_cholqr_recon(
 VARIANTS: dict[str, QRImpl] = {
     "blocked_hh_b64": make_blocked_householder(64),
     "cholqr2_recon": make_cholqr_recon(),
+    # Iteration 6: same CholeskyQR + BDGHKS modified-LU reconstruction as
+    # ``cholqr2_recon`` (identical numerics/sign conventions), but with the
+    # modified-LU panel width narrowed to 32 and CholeskyQR run in 2 passes.
+    # The modified-LU panel factorization cost scales with the block width, so a
+    # narrower panel (with the bulk done as batched-GEMM trailing updates) nearly
+    # halves the reconstruction cost; two re-orthogonalization passes already
+    # bring orthonormality well under both the checker gate and the per-element
+    # geqrf-repair guard on the benchmark + stress inputs (measured empirically).
+    "cholqr2_recon_blk": make_cholqr_recon(passes=2, lu_block=32),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
     "blocked_wy_b96": make_blocked_wy(96),
