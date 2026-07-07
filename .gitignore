@@ -9,3 +9,6 @@ venv/
 *.log.pid
 logs/
 scratch/
+
+# Generated benchmark figures (regenerable via scripts/plot_results.py)
+plots/*.png
