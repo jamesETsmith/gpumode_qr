@@ -214,3 +214,86 @@ def chol_inv_block(blocks: torch.Tensor):
         BLOCK=BLOCK,
     )
     return L, Li
+
+
+# ---------------------------------------------------------------------------
+# Iteration 10: batched triangular *inverse* of a small upper-triangular block.
+#
+# The Q-forming triangular solve ``X R = A`` (``X = A R^{-1}``, R upper) over the
+# two CholeskyQR2 passes is now the dominant CholeskyQR sub-term at b640 n512
+# (~74 ms): rocBLAS batched trsm serializes over the batch on gfx950. We replace
+# it with a blocked right-solve whose only per-block work is inverting the small
+# ``w x w`` upper-triangular diagonal block, done by a Triton kernel (one program
+# per batch element, whole batch inverted in parallel), and whose off-diagonal
+# corrections + the ``@ R_jj^{-1}`` multiply are batched GEMMs. See LOG iter 10.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _triu_inv_block_kernel(
+    A_ptr,        # (B, w, w) upper-triangular blocks (input)
+    Ai_ptr,       # (B, w, w) inverse (upper), output
+    b,            # batch size
+    w,            # actual block width (<= BLOCK)
+    stride_ab, stride_ai, stride_aj,
+    stride_ib, stride_ii, stride_ij,
+    BLOCK: tl.constexpr,
+):
+    """Inverse ``U^{-1}`` (upper) of one ``w x w`` upper-triangular block/program.
+
+    Row-backward substitution (from the last row up):
+        Uinv[i, :] = (e_i - sum_{k>i} U[i,k] * Uinv[k, :]) / U[i,i]
+    Singular blocks yield NaN/Inf which the caller's per-element orthonormality
+    guard detects and repairs with geqrf.
+    """
+    pid = tl.program_id(0)
+    if pid >= b:
+        return
+
+    rows = tl.arange(0, BLOCK)
+    cols = tl.arange(0, BLOCK)
+    rmask = rows < w
+    cmask = cols < w
+    tile_mask = rmask[:, None] & cmask[None, :]
+
+    base = A_ptr + pid * stride_ab
+    ptrs = base + rows[:, None] * stride_ai + cols[None, :] * stride_aj
+    tile = tl.load(ptrs, mask=tile_mask, other=0.0)
+
+    Minv = tl.zeros((BLOCK, BLOCK), dtype=tile.dtype)
+    for ii in range(0, BLOCK):
+        i = BLOCK - 1 - ii
+        if i < w:
+            is_ir = rows == i
+            Urow = tl.sum(tl.where(is_ir[:, None], tile, 0.0), axis=0)  # U[i, k] over cols
+            contrib = tl.where((rows > i)[:, None], Urow[:, None] * Minv, 0.0)
+            acc = tl.sum(contrib, axis=0)  # vector over cols
+            Uii = tl.sum(tl.where(is_ir[:, None] & (cols == i)[None, :], tile, 0.0))
+            ei = tl.where(cols == i, 1.0, 0.0)
+            rowval = (ei - acc) / Uii
+            Minv = tl.where(is_ir[:, None], rowval[None, :], Minv)
+
+    Minv = tl.where(cols[None, :] >= rows[:, None], Minv, 0.0)
+    Miptrs = Ai_ptr + pid * stride_ib + rows[:, None] * stride_ii + cols[None, :] * stride_ij
+    tl.store(Miptrs, Minv, mask=tile_mask)
+
+
+def triu_inv_block(blocks: torch.Tensor):
+    """Inverse of a batch of ``w x w`` upper-triangular blocks.
+
+    ``blocks``: (B, w, w) contiguous float32. Returns ``Uinv`` (B x w x w, upper
+    triangular) with ``Uinv = blocks^{-1}``.
+    """
+    b, w, w2 = blocks.shape
+    assert w == w2, "blocks must be square"
+    BLOCK = triton.next_power_of_2(w)
+    blk = blocks.contiguous()
+    Ui = torch.empty_like(blk)
+    grid = (b,)
+    _triu_inv_block_kernel[grid](
+        blk, Ui, b, w,
+        blk.stride(0), blk.stride(1), blk.stride(2),
+        Ui.stride(0), Ui.stride(1), Ui.stride(2),
+        BLOCK=BLOCK,
+    )
+    return Ui

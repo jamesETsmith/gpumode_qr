@@ -17,7 +17,21 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 ## Active variants
 
-- **`cholqr2_recon_fused2`** (active best, iteration 9) — identical to
+- **`cholqr2_recon_fused3`** (active best, iteration 10) — identical to
+  `cholqr2_recon_fused2` but the CholeskyQR2 **Q-forming triangular solve**
+  `X R = A` (`X = A R^{-1}`, R upper) across both passes is replaced by a custom
+  **blocked right-solve that runs the batch in parallel**. Only per-block work is
+  inverting the `w x w` (w=64) upper-triangular diagonal block via a Triton
+  kernel (one program per batch element, whole batch inverted in parallel,
+  reusing the iteration-9 in-register triangular-inverse idea); the off-diagonal
+  corrections `A_j - X_{<j} R_{<j,j}` and the `@ R_jj^{-1}` multiply are batched
+  GEMMs. This removes the rocBLAS batched-trsm serialization that dominated the
+  priority `b640 n512` shape after iteration 9 (~74 ms over the two passes).
+  Fused trsm + fused Cholesky both gated to **n<=768** (n1024/n2048/n4096 keep
+  the iteration-9 path, no regression). **New best on the fused-path shapes:
+  b640 n512 190.9 ms (vs 263.1 fused2 → 1.38x, vs geqrf 2572 → 13.5x), n352 9.3
+  ms (vs 15.3 fused2 → 1.64x, vs geqrf 102 → 11x).** See iteration 10.
+- **`cholqr2_recon_fused2`** (superseded by `_fused3`, iteration 9) — identical to
   `cholqr2_recon_fused` (2 passes, fused Triton modified-LU reconstruction) but
   the CholeskyQR term's **batched Cholesky is replaced by a custom right-looking
   blocked Cholesky** whose `w x w` (w=64) diagonal-block factorization *and its
@@ -117,6 +131,96 @@ Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
 
 +`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
 matches baseline there (small diffs are cross-GPU / run noise).
+
+## Iteration 10 — `cholqr2_recon_fused3` (custom batched triangular solve)
+
+- Branch: `variant/fused-trsm` (merged `--no-ff` into `main`).
+- Direction (single): attack the **Q-forming triangular solve** `X R = A`
+  (`X = A R^{-1}`, R upper), which iteration-9 profiling identified as the
+  dominant CholeskyQR sub-term at the priority `b640 n512` shape (~37 ms/pass,
+  ~74 ms over the two passes). rocBLAS batched trsm serializes over the batch on
+  gfx950. Replace it with a custom batched right-solve (one matrix per program,
+  blocked with GEMM trailing), reusing the iteration-9 in-register
+  triangular-inverse idea.
+
+### 1. Updated profile (b640 n512, iteration-9 medians for reference)
+
+| CholeskyQR sub-term (ms)          | b640 n512 |
+|----------------------------------|----------:|
+| A^T A GEMM                       |      1.6  |
+| batched Cholesky — fused kernel  |      7.8  |
+| **trsm form Q (X R = A, 2 passes)** |  **~74**  |
+
+- The trsm was the single largest CholeskyQR sub-term after the iteration-9
+  Cholesky kernel. Killing it takes b640 n512 from 263 → 191 ms (1.38x).
+
+### 2. Kernel + integration
+
+- `triu_inv_block` (Triton): one program per batch element inverts a `w x w`
+  upper-triangular block by row-backward substitution
+  (`Uinv[i,:] = (e_i - sum_{k>i} U[i,k] Uinv[k,:]) / U[i,i]`), `w <= 64`
+  (`BLOCK = next_power_of_2(w)`). Singular blocks yield NaN/Inf → caught by the
+  existing per-element orthonormality guard (geqrf repair).
+- `_trsm_right_upper_fused`: column-block forward sweep solving `X R = A`,
+  `X_j = (A_j - X_{<j} R_{<j,j}) R_jj^{-1}`. Diagonal-block inverse via the
+  kernel; the correction and the final multiply are batched GEMMs. No rocBLAS
+  trsm. Mathematically the same as `solve_triangular(R, A, upper, left=False)`.
+- New variant `cholqr2_recon_fused3 = make_cholqr_recon(passes=2, lu_block=32,
+  use_triton_modlu=True, use_triton_chol=True, chol_kblock=64,
+  chol_fused_max_n=768, use_triton_trsm=True, trsm_kblock=64,
+  trsm_fused_max_n=768)`. Everything except the Q-forming solve is byte-for-byte
+  the iteration-9 pipeline.
+- **n<=768 gate:** at n1024 a probe showed fused trsm is only ~3% faster (93.6
+  vs 96.9 ms) and fused Cholesky does not help, both within cross-run noise; to
+  guarantee no n1024 regression the fused trsm is gated to n<=768 (n1024 keeps
+  the library trsm, identical to fused2). n2048/n4096 still dispatch to geqrf
+  (batch<16).
+
+### 3. Correctness
+
+- Isolation (before integrating): `triu_inv_block` identity
+  `||U U^{-1} - I|| <= 5.4e-5` for w in {16,32,48,64}, batch in {1,640} on
+  well-conditioned upper blocks; and on the *actual* pipeline diagonal blocks
+  (n=352/512/1024) `max ||Rjj Rjj^{-1} - I|| <= 3.5e-7`. End-to-end vs the
+  chunked-`_trsm` reference on real benchmark inputs (comparing only the
+  CholeskyQR2-converged elements — the ill-conditioned elements the production
+  guard repairs are NaN in *both* paths): `||Q_fused - Q_ref|| / ||Q_ref||
+  <= 8.8e-7`, **identical set of non-converged elements** (ref/fused bad counts
+  1/1, 36/36, 4/4 — the fused solve introduces no extra failures), orth of the
+  converged Q comparable (n512: fused 2.8e-5 vs ref 1.3e-5, both << 1e-4 guard).
+- Harness: **PASS on all 7 benchmark shapes + the full stress suite.** b640 n512:
+  factor 1.22e-6 (gate 1.22e-3 stress / 7.6e-5 bench), orth 8.55e-5 (gate
+  3.8e-4). All stress cases (dense cond1/4, rank-deficient, near-rank-deficient,
+  banded, row-scaled, near-collinear, upper-triangular, clustered-scale at
+  n=32/176/512) PASS with wide margins.
+
+### 4. Performance (10 runs; fused3 GPU 5, fused2 GPU 7, clean head-to-head)
+
+| shape           |    n | batch |  geqrf | cholqr2_recon_fused2 | cholqr2_recon_fused3 | vs fused2 | vs geqrf |
+|-----------------|-----:|------:|-------:|---------------------:|---------------------:|----------:|---------:|
+| b20_n32_cond1   |   32 |    20 |   0.12 |                0.119 |                0.119 | tie*      | tie*     |
+| b40_n176_cond1  |  176 |    40 |   1.4  |                1.542 |                1.497 | tie*      | tie*     |
+| b40_n352_cond1  |  352 |    40 | 102    |               15.27  |            **9.31**  | 1.64x     | 11x      |
+| b640_n512_cond2 |  512 |   640 |2572    |              263.1   |          **190.9**   | **1.38x** | **13.5x**|
+| b60_n1024_cond2 | 1024 |    60 | 523    |               92.8   |             88.5     | tie**     | 5.9x     |
+| b8_n2048_cond1  | 2048 |     8 | 151    |              158.4   |            147.5     | tie*      | tie*     |
+| b2_n4096_cond1  | 4096 |     2 |  80    |               83.1   |             79.4     | tie*      | tie*     |
+
+*n<=256 and batch<16 dispatch to `torch.geqrf` (identical path); differences are
+cross-GPU / run noise. **n1024 uses the library trsm (n>768 gate), same path as
+fused2; the 88.5 vs 92.8 gap is cross-GPU noise.
+
+- **Faster or tied on every shape, no regressions** ⇒ promote, merge `--no-ff`.
+- Decision: **promote to active best.**
+- Next levers (iteration 11): with both the Cholesky and the Q-forming solve now
+  custom-kernelised, the b640 n512 CholeskyQR term is largely GEMM-bound. The
+  remaining large components are (a) the modified-LU **reconstruction** (fused
+  but still O(n/block) sequential diagonal-block steps) and (b) the batched
+  GEMMs themselves (`A^T A`, trailing updates) — worth a fresh component profile
+  of fused3 at b640 n512 to see whether reconstruction or GEMM now dominates.
+  Also still open: the small-batch large-n shapes (n2048/n4096) that fall back
+  to geqrf, and a possible mixed-precision (FP16/BF16) GEMM path for the
+  throughput-bound CholeskyQR GEMMs.
 
 ## Iteration 9 — `cholqr2_recon_fused2` (custom batched Cholesky kernel)
 
