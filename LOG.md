@@ -17,7 +17,30 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 ## Active variants
 
-(none promoted yet)
+- **`blocked_wy_b64`** (best so far) — blocked Householder QR with a compact-WY
+  trailing update via batched GEMM; hybrid dispatch to `torch.geqrf` for small n
+  (<=256) or small batch (<16). Wins on the large-n/large-batch shapes,
+  especially the priority `b640 n512` (~1.9x). See iteration 2.
+
+## Killed variants
+
+- `blocked_hh_b64` (iteration 1) — blocked QR via `torch.geqrf`+`torch.ormqr`;
+  slower than baseline everywhere because both primitives serialize over the
+  batch. Kept in registry for reference; not developed further.
+
+## Best per-shape median (ms) so far
+
+| shape           |    n | batch | torch.geqrf | blocked_wy_b64 | best   |
+|-----------------|-----:|------:|------------:|---------------:|--------|
+| b20_n32_cond1   |   32 |    20 |        0.12 |          0.12  | tie    |
+| b40_n176_cond1  |  176 |    40 |        1.4  |          1.63  | geqrf  |
+| b40_n352_cond1  |  352 |    40 |      102    |         75.3   | **wy** |
+| b640_n512_cond2 |  512 |   640 |     2572    |       1381     | **wy** |
+| b60_n1024_cond2 | 1024 |    60 |      523    |        451     | **wy** |
+| b8_n2048_cond1  | 2048 |     8 |      151    |        173*    | geqrf  |
+| b2_n4096_cond1  | 4096 |     2 |       80    |         91*    | geqrf  |
+
+*blocked_wy falls back to geqrf here (batch<16); small diffs are cross-GPU noise.
 
 ## Iteration 1 — `blocked_hh_b64` (blocked/panel Householder QR)
 
@@ -35,6 +58,22 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 - Decision: **strong candidate to kill.** Torch-level composition of rocSOLVER
   primitives is a dead end for the large-n regime. Keep the code+result for the
   record; do not iterate further on this exact approach.
+
+## Iteration 2 — `blocked_wy_b64` (blocked QR + GEMM WY update)
+
+- Branch: `variant/gemm-wy`
+- Idea: keep blocked panels on `torch.geqrf`, but replace the `ormqr` trailing
+  update with a compact-WY update applied via batched GEMM
+  (`C -= V @ (T^T @ (V^T @ C))`, T from the LARFT recurrence on `W = V^T V`).
+  Probe showed panel geqrf is far cheaper than full-width geqrf and the WY GEMMs
+  are ~free, so the `ormqr` bottleneck (which sank iteration 1) is removed.
+- Dispatch: `geqrf` for n<=256 or batch<16; blocked-WY otherwise (never regress).
+- Correctness: PASS on all gates + full stress suite.
+- Performance vs baseline: **n352 1.35x, b640 n512 1.86x, n1024 1.16x**; other
+  shapes tie (fast path / fallback).
+- Decision: **keep as active best.** Next ideas: tune block size; replace the
+  serialized panel `geqrf` with a custom batched panel kernel (the remaining
+  bottleneck); try recursive panel factorization; mixed-precision GEMM update.
 
 ### Branching implications (next ideas)
 
