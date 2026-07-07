@@ -17,7 +17,17 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 ## Active variants
 
-- **`cholqr2_recon`** (active best) — CholeskyQR (3 unshifted passes) for an
+- **`cholqr2_recon_blk`** (active best, iteration 6) — identical CholeskyQR +
+  BDGHKS modified-LU reconstruction as `cholqr2_recon`, but the modified-LU panel
+  width is narrowed from 64 to **32** and CholeskyQR runs in **2** unshifted
+  passes instead of 3. The modified-LU panel factorization cost scales with the
+  block width (bulk done as batched-GEMM trailing updates), so the narrower panel
+  nearly halves reconstruction cost, and 2 passes already bring orthonormality
+  well under both the checker gate (~550x margin at n512) and the per-element
+  geqrf-repair guard. **New best on all blocked-path shapes: b640 n512 338 ms
+  (vs 476 for cholqr2_recon → 1.41x, vs geqrf 2572 → 7.6x), n1024 191 ms (1.22x /
+  2.7x), n352 62 ms.** See iteration 6.
+- **`cholqr2_recon`** (superseded by `_blk`) — CholeskyQR (3 unshifted passes) for an
   orthonormal Q + upper-triangular R, then BDGHKS modified-LU Householder
   reconstruction to emit compact `(H, tau)`. Batched GEMM/Cholesky are far more
   throughput-efficient than serialized panel `geqrf`. Hybrid dispatch to
@@ -64,6 +74,21 @@ Updated best per shape after iteration 5 (`cholqr2_recon`, 10 runs, GPU 5):
 | b2_n4096_cond1  | 4096 |     2 |       80    |         91*    |        79.4+ | geqrf     |
 
 +`cholqr2_recon` also falls back to geqrf here (batch<16), so it matches baseline.
+
+Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
+
+| shape           |    n | batch | torch.geqrf | cholqr2_recon | cholqr2_recon_blk | best      |
+|-----------------|-----:|------:|------------:|--------------:|------------------:|-----------|
+| b20_n32_cond1   |   32 |    20 |        0.12 |         0.12  |             0.12  | tie       |
+| b40_n176_cond1  |  176 |    40 |        1.4  |         1.51  |             1.52  | geqrf     |
+| b40_n352_cond1  |  352 |    40 |      102    |        72.3  |            62.4   | **blk**   |
+| b640_n512_cond2 |  512 |   640 |     2572    |       475.8  |           338.4   | **blk**   |
+| b60_n1024_cond2 | 1024 |    60 |      523    |       233.1  |           191.2   | **blk**   |
+| b8_n2048_cond1  | 2048 |     8 |      151    |       150.8+ |           152.4+  | geqrf     |
+| b2_n4096_cond1  | 4096 |     2 |       80    |        79.4+ |            80.1+  | geqrf     |
+
++`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
+matches baseline there (small diffs are cross-GPU / run noise).
 
 ## Iteration 1 — `blocked_hh_b64` (blocked/panel Householder QR)
 
@@ -200,3 +225,48 @@ directions worth exploring as separate variants:
   batch — a more block/GEMM-heavy panel or a fused kernel), and possibly extend
   the fast path to the small-batch large-n shapes (n2048/n4096) if a batched-safe
   Cholesky path can be found there.
+
+## Iteration 6 — `cholqr2_recon_blk` (faster Householder reconstruction)
+
+- Branch: `variant/recon-blocked` (merged to `main`).
+- Direction: speed up the modified-LU Householder reconstruction, which
+  iteration 5 identified as the dominant remaining cost. Reuse the *exact* same
+  reconstruction math and sign conventions as `cholqr2_recon` (no numeric
+  changes) via `make_cholqr_recon(passes=2, lu_block=32)`.
+- Profiling (GPU 2) that motivated the change:
+  * The modified-LU cost is dominated by the panel factorization, whose cost
+    scales with the panel width (the trailing update is already batched GEMM).
+    `_modified_lu` panel-width sweep at n512/b640: blk16 78, blk24 75,
+    **blk32 73**, blk48 165 (anomalous spike), blk64 133 ms → block 32 nearly
+    halves it vs the previous default of 64. n1024/b60: blk32 138 vs blk64 165.
+  * CholeskyQR is the other half (n512/b640: 3 passes ≈ 247 ms, 2 passes ≈ 164
+    ms). Contrary to the iteration-5 note, **2 passes is sufficient** with the
+    current per-element guard: at n512 the surviving (non-repaired) elements have
+    orth error ≈ 1.0e-5 (gate 6.1e-3, guard 1e-4), and the geqrf-repair fallback
+    count is unchanged at 29/640 vs 3 passes. So dropping the 3rd pass costs no
+    extra fallbacks and no accuracy relevant to the gate.
+- Correctness: **PASS on all benchmark shapes and the full stress suite** with
+  wide margins. Benchmark inputs: factor residual ≤ 1.8e-6 (thresholds
+  7.6e-5…), orthogonality ≤ 1.1e-4 (thresholds 3.8e-4…6.1e-3). Stress (dense
+  cond1/4, rank-deficient, near-rank-deficient, banded, row-scaled,
+  near-collinear, upper-triangular, clustered-scale at n=32/176/512) all PASS.
+- Performance (10 runs, GPU 5), median ms — **new best** on every blocked-path
+  shape:
+
+| shape           |    n | batch | geqrf | cholqr2_recon | cholqr2_recon_blk | speedup vs recon | vs geqrf |
+|-----------------|-----:|------:|------:|--------------:|------------------:|-----------------:|---------:|
+| b40_n352_cond1  |  352 |    40 |  102  |         72.3  |            62.4   | 1.16x            | 1.6x     |
+| b640_n512_cond2 |  512 |   640 | 2572  |        475.8  |           338.4   | **1.41x**        | **7.6x** |
+| b60_n1024_cond2 | 1024 |    60 |  523  |        233.1  |           191.2   | 1.22x            | 2.7x     |
+
+  Small n (≤256) and small batch (<16, n2048/n4096) dispatch to `torch.geqrf`
+  and match baseline (never regress).
+- Decision: **promote to active best** and merge `--no-ff` into `main`
+  (strictly faster than `cholqr2_recon` on all fast-path shapes; gates pass with
+  wide margin; no regression on fallback shapes).
+- Next levers: the reconstruction's per-column base loop (n sequential steps) is
+  still an irreducible PyTorch-level cost — a fused batched panel kernel
+  (Triton/HIP) is the next structural step. Also worth probing: whether the
+  CholeskyQR batched-Cholesky/`_trsm` serialization on gfx950 can be reduced
+  (largest single component now), and extending the fast path to the
+  small-batch large-n shapes (n2048/n4096).
