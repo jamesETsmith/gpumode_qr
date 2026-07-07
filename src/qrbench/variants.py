@@ -466,6 +466,22 @@ def make_cholqr_recon(
     (e.g. rank-deficient inputs where the Cholesky is not positive definite).
     """
 
+    def _reconstruct(Q: torch.Tensor, A_: torch.Tensor):
+        """Modified-LU Householder reconstruction: (orthonormal Q, A) -> (H, tau)."""
+        if use_triton_modlu_inv:
+            B, s = _modified_lu_fused_inv(Q, block=lu_block)
+        elif use_triton_modlu:
+            B, s = _modified_lu_fused(Q, block=lu_block)
+        else:
+            B, s = _modified_lu(Q, block=lu_block)
+        pivots = torch.diagonal(B, dim1=-2, dim2=-1)
+        tau = pivots.abs()
+        # Q_recon = householder_product(H,tau) = Q @ diag(s);
+        # R_stored = (Q diag(s))^T A = diag(s) (Q^T A).
+        R_stored = torch.triu(s.unsqueeze(-1) * (Q.transpose(-2, -1) @ A_))
+        H = torch.tril(B, -1) + R_stored
+        return H, tau
+
     def impl(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch, n, _ = A.shape
         if n <= small_n or batch < min_batch:
@@ -483,62 +499,63 @@ def make_cholqr_recon(
             # Per-element guard: CholeskyQR can fail to produce an orthonormal Q
             # for ill-conditioned / near-rank-deficient elements. The checker
             # reduces with a max over the batch, so one bad element fails the
-            # whole shape. Detect such elements from Q's orthonormality error
-            # and repair them with torch.geqrf below.
+            # whole shape. Detect such elements from Q's orthonormality error.
             eye = torch.eye(n, device=A.device, dtype=A.dtype)
             ortho_err = (Q.transpose(-2, -1) @ Q - eye).abs().amax(dim=(-2, -1))
             bad = ~torch.isfinite(ortho_err) | (ortho_err > 1e-4)
 
-            # Batched repair of the non-converged elements (iteration 14).
-            # The shift_coef=1.5 main pass minimizes the *total* bad count, but
-            # the handful of residual bad are severely ill-conditioned
-            # (cond(A^T A) ~ 1e12-1e15 on the dense cond=2 benchmark) and their
-            # first shifted Cholesky still NaNs. Re-running shifted CholeskyQR on
-            # just those elements *as a batched sub-problem* with a larger shift
-            # (repair_shift_coef, default 3.0) and more refinement passes makes
-            # that first Cholesky positive-definite while the extra unshifted
-            # passes remove the larger shift's bias, driving Q to orthonormality
-            # (~8e-7). This replaces the serialized, host-synchronizing per-element
-            # ``torch.geqrf`` repair with a single batched sub-pipeline (no Python
-            # loop over elements). Genuinely rank-deficient stress inputs do not
-            # converge here and still fall through to the geqrf guard below.
-            if batch_repair and bad.any():
-                idx = torch.nonzero(bad, as_tuple=True)[0]
-                # The bad subbatch is tiny (a few elements), so the fused
-                # kernels' per-block launch overhead dominates; the library
-                # blocked Cholesky / chunked trsm are cheaper at this batch size.
-                Qsub, _ = _choleskyqr(
-                    A[idx], passes=repair_passes, chol_block=chol_block,
-                    use_triton_chol=False, use_triton_trsm=False,
-                    shift=True, shift_coef=repair_shift_coef,
-                )
-                oe_sub = (Qsub.transpose(-2, -1) @ Qsub - eye).abs().amax(dim=(-2, -1))
-                sub_bad = ~torch.isfinite(oe_sub) | (oe_sub > 1e-4)
-                Q = Q.clone()
-                Q[idx] = Qsub
-                bad = bad.clone()
-                bad[idx] = sub_bad
-
-            if use_triton_modlu_inv:
-                B, s = _modified_lu_fused_inv(Q, block=lu_block)
-            elif use_triton_modlu:
-                B, s = _modified_lu_fused(Q, block=lu_block)
-            else:
-                B, s = _modified_lu(Q, block=lu_block)
-            pivots = torch.diagonal(B, dim1=-2, dim2=-1)
-            tau = pivots.abs()
-            # Q_recon = householder_product(H,tau) = Q @ diag(s);
-            # R_stored = (Q diag(s))^T A = diag(s) (Q^T A).
-            R_stored = torch.triu(s.unsqueeze(-1) * (Q.transpose(-2, -1) @ A))
-            H = torch.tril(B, -1) + R_stored
-
+            H, tau = _reconstruct(Q, A)
             bad = bad | ~torch.isfinite(H).all(dim=(-2, -1)) | ~torch.isfinite(tau).all(dim=-1)
+
+            # Single host sync (identical to the non-repair variants on the
+            # common, all-good path so there is no extra-sync overhead when no
+            # element needs repair). Everything below only runs for the rare
+            # shapes/elements that fail the guard.
             if bad.any():
-                Hg, taug = torch.geqrf(A[bad])
+                idx = torch.nonzero(bad, as_tuple=True)[0]
                 H = H.clone()
                 tau = tau.clone()
-                H[bad] = Hg
-                tau[bad] = taug
+                if batch_repair:
+                    # Batched repair (iteration 14): re-run shifted CholeskyQR on
+                    # just the bad elements as a small batched sub-problem with a
+                    # *larger* shift (repair_shift_coef, default 3.0) and more
+                    # refinement passes. The shift_coef=1.5 main pass minimizes the
+                    # total bad count, but the residual bad are severely
+                    # ill-conditioned (cond(A^T A) ~ 1e12-1e15 on the dense cond=2
+                    # benchmark) so their first shifted Cholesky still NaNs; the
+                    # larger shift makes it positive-definite and the extra
+                    # unshifted passes remove the bias, driving Q to orthonormality
+                    # (~8e-7). This replaces the serialized, host-synchronizing
+                    # per-element torch.geqrf repair with one batched sub-pipeline
+                    # (no Python loop over elements). The bad subbatch is tiny, so
+                    # the library blocked Cholesky / chunked trsm are cheaper than
+                    # the launch-bound fused kernels at that batch size.
+                    Asub = A[idx]
+                    Qsub, _ = _choleskyqr(
+                        Asub, passes=repair_passes, chol_block=chol_block,
+                        use_triton_chol=False, use_triton_trsm=False,
+                        shift=True, shift_coef=repair_shift_coef,
+                    )
+                    oe_sub = (Qsub.transpose(-2, -1) @ Qsub - eye).abs().amax(dim=(-2, -1))
+                    Hsub, tausub = _reconstruct(Qsub, Asub)
+                    sub_bad = (
+                        ~torch.isfinite(oe_sub) | (oe_sub > 1e-4)
+                        | ~torch.isfinite(Hsub).all(dim=(-2, -1))
+                        | ~torch.isfinite(tausub).all(dim=-1)
+                    )
+                    H[idx] = Hsub
+                    tau[idx] = tausub
+                    # Genuinely rank-deficient stress inputs do not converge under
+                    # any finite shift; repair them with the geqrf guard (rare).
+                    if sub_bad.any():
+                        sidx = idx[sub_bad]
+                        Hg, taug = torch.geqrf(A[sidx])
+                        H[sidx] = Hg
+                        tau[sidx] = taug
+                else:
+                    Hg, taug = torch.geqrf(A[idx])
+                    H[idx] = Hg
+                    tau[idx] = taug
             return H, tau
         except Exception:  # noqa: BLE001 - numerical breakdown -> safe baseline
             return torch.geqrf(A)
