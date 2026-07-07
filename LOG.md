@@ -17,7 +17,25 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 ## Active variants
 
-- **`cholqr3_shift_recon_fusedasm`** (active best, iteration 16) — identical
+- **`cholqr3_shift_recon_repair2`** (active best, iteration 17) — identical
+  pipeline to `cholqr3_shift_recon_fusedasm` EXCEPT the batched repair of the ~3
+  near-rank-deficient elements at b640 n512 uses **one fewer unshifted refinement
+  pass** (`repair_passes` 3 → 2). Iteration-17 profiling of the repair sub-batch
+  (3 elements, n=512, **launch/overhead-bound, not FLOP-bound**) showed the
+  repair's shifted-CholeskyQR is the dominant repair cost (~7.7 of ~11 ms
+  isolated) and scales ~2 ms/pass, while the modified-LU reconstruction (~3 ms)
+  is already on its cheapest path. With `repair_shift_coef=3.0` the sub-batch's
+  first shifted Cholesky is already positive-definite, so a single unshifted
+  refinement (passes=2 ⇒ 1 shifted + 2 unshifted) already drives the repaired Q
+  to orthonormality **1.07e-6** (vs 7.75e-7 at passes=3) — both far under the
+  1e-4 guard and the checker orth gate (~6.1e-3 at n512), and *better* than the
+  main batch's ~1.07e-4, so the batch-max residual is byte-unchanged (factor
+  1.17e-6, orth 1.07e-4). passes=1 fails (ortho ~1.5e2) so 2 is the floor.
+  Genuinely rank-deficient STRESS inputs still fall through to the geqrf guard.
+  **Repair cost 11.9 → 9.8 ms isolated; b640 n512 60.0 → 58.1 ms (GPU 5 DB) /
+  62.0 → 59.9 ms same-GPU-2 head-to-head → ~1.03x, vs geqrf ~44x; every other
+  shape tied.** See iteration 17.
+- **`cholqr3_shift_recon_fusedasm`** (superseded by `_repair2`, iteration 16) — identical
   pipeline to `cholqr3_shift_recon_batchfix` but the modified-LU Householder
   reconstruction's **R-assembly** (`R_stored = triu(s*(Q^T A)); H = tril(B,-1) +
   R_stored`) is **fused into a single Triton pass** (`assemble_recon`): one
@@ -214,6 +232,99 @@ Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
 
 +`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
 matches baseline there (small diffs are cross-GPU / run noise).
+
+## Iteration 17 — `cholqr3_shift_recon_repair2` (lighter batched repair)
+
+- Branch: `variant/repair-lite` (merged `--no-ff` into `main`).
+- Direction (single, bounded): shrink the ~8 ms batched repair at b640 n512 (the
+  `if bad.any()` branch that re-solves the ~3 near-rank-deficient elements which
+  NaN under the main `shift_coef=1.5`) without losing correctness on the
+  rank-deficient / stress inputs the repair protects.
+
+### 1. Profile of the repair sub-batch (b640 n512, GPU 2, medians, ms)
+
+The bad elements are **idx [63, 309, 622]** (dense cond=2 benchmark), gathered
+into a 3-element n=512 sub-batch. The repair is **launch/overhead-bound, not
+FLOP-bound** (3 elements). Isolated component timing:
+
+| repair component (ms, 3-elt sub-batch, n=512)      |  time |
+|----------------------------------------------------|------:|
+| full repair (current, `repair_passes=3`)           | 11.9  |
+| — shifted CholeskyQR, `passes=3` coef=3 (library)  |  8.26 |
+| — shifted CholeskyQR, `passes=2` coef=3 (library)  |  6.24 |
+| — shifted CholeskyQR, `passes=1` coef=3 (library)  |  4.19 |
+| — shifted CholeskyQR, `passes=3` coef=3 (**triton**) | 12.2  |
+| — reconstruct(Qsub) (modlu-inv triton + QtA + asm) |  3.21 |
+| — reconstruct(Qsub) (modlu fused-trsm)             |  3.88 |
+| — reconstruct(Qsub) (pure-pytorch `_modified_lu`)  | 67.5  |
+| **full repair, `repair_passes=2`**                 | **9.8** |
+
+- The shifted CholeskyQR **dominates** the repair and scales ~2 ms/pass; the
+  library path is right for this tiny batch (the fused Triton chol is *slower*,
+  12.2 vs 8.3 ms — one program/batch element = 3 programs, terrible occupancy).
+  The reconstruction (~3 ms) is already on its cheapest path (the triton-inv
+  modified-LU; fused-trsm is a touch slower, pure-pytorch is 20x worse).
+- **Repaired-Q orthonormality vs pass count** (coef=3.0, per-element):
+  passes=1 → **1.5e2 (fails)**; passes=2 → **1.07e-6**; passes=3 → 7.75e-7;
+  passes=4 → 5.96e-7. So **passes=2 is the floor** and is already orthonormal to
+  ~1e-6 — 100x better than the main batch's ~1.07e-4, so cutting to 2 passes
+  leaves the batch-max residual unchanged while removing one ~2 ms Cholesky pass.
+
+### 2. Change (repair-path-only; everything else byte-for-byte `_fusedasm`)
+
+- New variant `cholqr3_shift_recon_repair2 = _fusedasm` with `repair_passes=3 →
+  2` (the *only* difference). No kernel or main-pipeline changes.
+
+### 3. Correctness — both gates PASS on all 7 shapes + full stress
+
+- Harness (GPU 2, warmup 3 / iters 3 and the GPU-5 DB run): **PASS on all 7
+  benchmark shapes + the full stress suite.** b640 n512 factor **1.17e-6**, orth
+  **1.07e-4** (identical to `_fusedasm` — the repaired elements sit below the
+  batch max). b60 n1024 factor 1.98e-6, orth 1.17e-4.
+- **Rank-deficient danger cases held:** `rank_deficient` / `near_rank_deficient`
+  / `near_collinear` / `clustered_scale` at n=32/176/512 all PASS with wide
+  margins (rank_deficient_n512 factor 6.92e-7, orth 1.49e-5). Genuinely
+  rank-deficient inputs (which do not converge under any finite shift) still
+  fall through to the geqrf last-resort guard exactly as before.
+
+### 4. Performance (10 runs)
+
+Same-GPU-2 head-to-head (the decision-relevant comparison) + GPU-5 DB run:
+
+| shape           |    n | batch |  geqrf | fusedasm (GPU2) | repair2 (GPU2) | repair2 (GPU5 DB) | vs fusedasm | vs geqrf |
+|-----------------|-----:|------:|-------:|----------------:|---------------:|------------------:|------------:|---------:|
+| b20_n32_cond1   |   32 |    20 |   0.12 |           0.120 |          0.121 |             0.119 | tie*        | tie*     |
+| b40_n176_cond1  |  176 |    40 |   1.4  |           1.628 |          1.620 |             1.498 | tie*        | tie*     |
+| b40_n352_cond1  |  352 |    40 | 102    |           8.317 |          8.301 |             8.142 | tie         | 12.5x    |
+| b640_n512_cond2 |  512 |   640 |2572    |          61.961 |     **59.914** |         **58.068**| **1.03x**   | **44x**  |
+| b60_n1024_cond2 | 1024 |    60 | 523    |          46.812 |         46.856 |            46.335 | tie         | 11.3x    |
+| b8_n2048_cond1  | 2048 |     8 | 151    |         169.374 |        173.570 |           148.031 | tie*        | tie*     |
+| b2_n4096_cond1  | 4096 |     2 |  80    |          88.942 |         90.898 |            79.394 | tie*        | tie*     |
+
+*n<=256 and batch<16 dispatch to `torch.geqrf` (identical code path); the
+n2048/n4096 numbers are cross-run/GPU noise on the shared fallback path.
+
+- **Faster on n512 (~1.03x, ~2 ms), tied on every other shape, output residuals
+  unchanged** ⇒ promote, merge `--no-ff`.
+- Decision: **promote to active best.**
+
+### 5. Recommendation — priority shape is effectively CONVERGED
+
+- The absolute win is ~2 ms (~3% of the ~60 ms n512 wall), delivered exactly as
+  predicted by the repair profile with zero numerical risk — but it is a small,
+  bounded shave, consistent with the diminishing-returns trend (iters 12→17:
+  66 → 58 ms, ~1.14x total over five iterations, now ~1–3%/iter).
+- **Verdict: the b640 n512 optimization is effectively converged (~44x over the
+  geqrf baseline).** The remaining wall is a handful of near-irreducible FP32
+  pieces: fused Cholesky (~18 ms over 3 shifted-CQR3 passes), modified-LU recon
+  kernel (~9 ms) + Q-solve + load-bearing GEMMs (`A^T A`, `Q^T A`, trailing)
+  (~7 ms), and the now-9.8 ms repair. None has an obvious ≥10% structural lever
+  left in FP32 without risking the tight factor/orth gates (mixed precision was
+  already a negative result in iteration 15). **Recommendation: wind the loop
+  down on the priority shape.** The only remaining *untested* territory is the
+  low-weight n2048/n4096 shapes that still dispatch to geqrf (batch<16, where
+  geqrf is already competitive) — worth at most one exploratory iteration, not a
+  priority-shape lever. No concrete >10% lever remains on b640 n512.
 
 ## Iteration 16 — `cholqr3_shift_recon_fusedasm` (fused modified-LU R-assembly)
 

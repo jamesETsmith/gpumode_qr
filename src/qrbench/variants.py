@@ -707,6 +707,32 @@ VARIANTS: dict[str, QRImpl] = {
         batch_repair=True, repair_passes=3, repair_shift_coef=3.0,
         fused_assembly=True,
     ),
+    # Iteration 17: identical pipeline to ``cholqr3_shift_recon_fusedasm`` (the
+    # active best) EXCEPT the batched repair of the ~3 near-rank-deficient
+    # elements at b640 n512 uses ONE fewer unshifted refinement pass
+    # (``repair_passes`` 3 -> 2). Iteration-17 profiling of the repair sub-batch
+    # (3 elements, n=512, launch/overhead-bound not FLOP-bound) showed the
+    # repair's shifted-CholeskyQR is the dominant repair cost (~7.7 of ~11 ms
+    # isolated) and scales with the pass count (~2 ms/pass); the modified-LU
+    # reconstruction (~3 ms) is already on its cheapest path. With
+    # ``repair_shift_coef=3.0`` the sub-batch's first shifted Cholesky is already
+    # positive-definite, so a single unshifted refinement (passes=2 => 1 shifted
+    # + 2 unshifted) already drives the repaired Q to orthonormality **1.07e-6**
+    # (vs 7.75e-7 at passes=3) — both far under the 1e-4 orthonormality guard and
+    # the checker orth gate (~6.1e-3 at n512), and *better* than the main batch's
+    # ~1.07e-4, so the batch-max residual is unchanged. passes=1 fails
+    # (ortho ~1.5e2), so 2 is the floor. Genuinely rank-deficient STRESS inputs
+    # (which do not converge under any finite shift) still fall through to the
+    # geqrf guard exactly as before. Everything except ``repair_passes`` is
+    # byte-for-byte ``_fusedasm``. See LOG.md iteration 17.
+    "cholqr3_shift_recon_repair2": make_cholqr_recon(
+        passes=2, lu_block=32, use_triton_modlu_inv=True,
+        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=1024,
+        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
+        shift=True, shift_coef=1.5,
+        batch_repair=True, repair_passes=2, repair_shift_coef=3.0,
+        fused_assembly=True,
+    ),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
     "blocked_wy_b96": make_blocked_wy(96),
