@@ -119,5 +119,8 @@ def make_blocked_wy(block: int = 64, small_n: int = 256, min_batch: int = 16) ->
 
 VARIANTS: dict[str, QRImpl] = {
     "blocked_hh_b64": make_blocked_householder(64),
+    "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
+    "blocked_wy_b96": make_blocked_wy(96),
+    "blocked_wy_b128": make_blocked_wy(128),
 }
