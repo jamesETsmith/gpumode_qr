@@ -17,7 +17,28 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 ## Active variants
 
-- **`cholqr3_shift_recon_bign`** (active best, iteration 13) — identical
+- **`cholqr3_shift_recon_batchfix`** (active best, iteration 14) — identical
+  pipeline to `cholqr3_shift_recon_bign` but the **serialized per-element
+  `torch.geqrf` repair** of the residual non-converged elements is replaced by a
+  **batched shifted-CholeskyQR sub-pipeline**. The `shift_coef=1.5` main pass
+  minimizes the *total* bad count (~3/640 at b640 n512) but those residual bad
+  are severely ill-conditioned (`cond(A^T A) ~ 1e12–1e15` on the dense cond=2
+  benchmark) so their first shifted Cholesky still NaNs. The repair gathers the
+  bad elements, re-runs shifted CholeskyQR on that small batch with a **larger
+  shift (`repair_shift_coef=3.0`) and 3 refinement passes** (the larger shift
+  makes the first Cholesky positive-definite; the extra unshifted passes remove
+  its bias → Q orthonormal to ~8e-7), reconstructs their `(H, tau)`, and scatters
+  back — **no Python loop over elements, no serialized geqrf on the benchmark**
+  (geqrf calls at b640 n512: 3 → 0). The repair uses the library blocked
+  Cholesky / chunked trsm (cheaper than the launch-bound fused kernels at a
+  ~3-element batch). The geqrf guard remains ONLY as a last resort for genuinely
+  rank-deficient STRESS inputs (which do not converge under any finite shift;
+  `rank_deficient_n512` still triggers 1 geqrf call and passes). The repair is
+  folded inside the single existing `if bad.any()` branch so the common all-good
+  shapes (n352, n1024) keep byte-for-byte one host sync (no extra-sync overhead).
+  **b640 n512 63.0 ms (vs 65.8 bign → 1.04x, vs geqrf 2689 → 43x, same GPU 2);
+  every other shape tied with bign (no regression).** See iteration 14.
+- **`cholqr3_shift_recon_bign`** (superseded by `_batchfix`, iteration 13) — identical
   pipeline to `cholqr3_shift_recon_invlu` but the **fused blocked Cholesky gate
   is raised from n<=768 to n<=1024**, so the n1024 benchmark shape uses the
   custom right-looking blocked Cholesky (Triton diagonal-block factor+inverse +
@@ -178,6 +199,102 @@ Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
 
 +`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
 matches baseline there (small diffs are cross-GPU / run noise).
+
+## Iteration 14 — `cholqr3_shift_recon_batchfix` (batched repair, kills serialized geqrf)
+
+- Branch: `variant/batch-repair` (merged `--no-ff` into `main`).
+- Direction (single, bounded): eliminate the **serialized, host-synchronizing
+  `torch.geqrf` repair** of the ~3 non-converged elements at b640 n512, which the
+  iteration-12/14 profile showed costs ~13–14 ms (rocSOLVER serializes over the
+  batch on gfx950). Replace it with a batched, non-serializing fix (option (a):
+  gather the bad elements, run the shifted CholeskyQR sub-pipeline, scatter back).
+
+### 1. Characterizing the residual bad elements (b60/b640, GPU 2)
+
+- At b640 n512 the residual bad are **idx [63, 309, 622]**, all **NaN** Q, with
+  `cond(A^T A) ≈ 3.0e12 / 1.9e15 / 2.9e13`. Under the main `shift_coef=1.5` their
+  first shifted Cholesky NaNs regardless of pass count (2/3/4/6/8 passes → still
+  3 bad). So more *global* passes do not help (confirms iteration-11 finding).
+- Gathering just those 3 into a sub-batch and re-running shifted CholeskyQR with a
+  **larger shift** converges them: `shift_coef=3.0, passes≥3 → 0 bad`
+  (max ortho 8.3e-7), stable for passes 3–10. `shift_coef=1.5` still NaNs;
+  `shift_coef=8.0` over-shifts (2 bad). So **3.0 / 3 passes** is the repair.
+- Repair-cost isolation (3-element sub-batch, n512, GPU 2): serialized
+  `torch.geqrf(A[bad])` **12.85 ms**; batched **fused** repair 10.89 ms; batched
+  **library** repair **8.35 ms** (all converge to 0 bad). The tiny sub-batch is
+  launch-bound, so the library blocked-Cholesky/chunked-trsm beats the fused
+  kernels → repair uses the library path.
+
+### 2. Change (reuses all existing passing numerics except the repair path)
+
+- New variant `cholqr3_shift_recon_batchfix = make_cholqr_recon(passes=2,
+  lu_block=32, use_triton_modlu_inv=True, use_triton_chol=True, chol_kblock=64,
+  chol_fused_max_n=1024, use_triton_trsm=True, trsm_kblock=64,
+  trsm_fused_max_n=768, shift=True, shift_coef=1.5, **batch_repair=True,
+  repair_passes=3, repair_shift_coef=3.0**)`. The main pipeline is byte-for-byte
+  `_bign`.
+- The reconstruction runs first; the batched repair is folded **inside the single
+  existing `if bad.any()` branch** (it recomputes the modified-LU only for the
+  tiny bad sub-batch, then any element still bad after repair — genuinely
+  rank-deficient — falls through to the geqrf guard). This keeps the common
+  no-bad shapes (n352, n1024) at exactly one host sync, identical to `_bign` (an
+  earlier pre-modlu repair check added a 2nd sync and cost ~0.5 ms at n352).
+
+### 3. n512 profile before/after
+
+| b640 n512                     | bign (before) | batchfix (after) |
+|-------------------------------|--------------:|-----------------:|
+| geqrf calls / run             |             1 |            **0** |
+| repair cost (isolated)        | 12.85 ms geqrf| 8.35 ms batched  |
+| full wall (same GPU 2)        |      65.8 ms  |      **63.0 ms** |
+
+- The serialized/host-synchronizing geqrf on the benchmark is **removed** (0
+  calls). Net wall ~2.8 ms (1.04x) — the batched repair (~8–9 ms incl. sub-batch
+  reconstruction) is cheaper than, but the same order as, the 12.85 ms geqrf it
+  replaces, so the removable cost is bounded by the repair itself.
+
+### 4. Correctness (rank-deficient / stress specifically)
+
+- Harness: **PASS on all 7 benchmark shapes + the full stress suite.** b640 n512:
+  factor 1.17e-6, orth 1.07e-4. b60 n1024: factor 1.98e-6, orth 1.17e-4.
+- **Rank-deficient danger cases held:** `rank_deficient` / `near_rank_deficient`
+  / `near_collinear` / `clustered_scale` at n=32/176/512 all PASS with wide
+  margins (e.g. rank_deficient_n512 factor 6.92e-7, orth 1.49e-5). Verified the
+  geqrf guard still fires for genuinely rank-deficient input:
+  `rank_deficient_n512` → **1 geqrf call** (the batched repair does not converge
+  a truly singular matrix, so it correctly falls through), whereas the dense
+  benchmark n512 → **0 geqrf calls** (batched repair handles it).
+
+### 5. Performance (10 runs, same GPU 2 for a clean head-to-head)
+
+| shape           |    n | batch |  geqrf | cholqr3_shift_recon_bign | cholqr3_shift_recon_batchfix | vs bign | vs geqrf |
+|-----------------|-----:|------:|-------:|-------------------------:|-----------------------------:|--------:|---------:|
+| b20_n32_cond1   |   32 |    20 |  0.131 |                    0.130 |                        0.131 | tie*    | tie*     |
+| b40_n176_cond1  |  176 |    40 |  1.640 |                    1.644 |                        1.649 | tie*    | tie*     |
+| b40_n352_cond1  |  352 |    40 |101.327 |                    8.367 |                        8.368 | tie     | 12.1x    |
+| b640_n512_cond2 |  512 |   640 |2689.1  |                   65.785 |                   **63.034** |**1.04x**| **43x**  |
+| b60_n1024_cond2 | 1024 |    60 | 597.8  |                   46.740 |                       46.758 | tie     | 12.8x    |
+| b8_n2048_cond1  | 2048 |     8 |167.586 |                  167.442 |                      167.487 | tie*    | tie*     |
+| b2_n4096_cond1  | 4096 |     2 | 88.243 |                   88.076 |                       88.075 | tie*    | tie*     |
+
+*n<=256 and batch<16 dispatch to `torch.geqrf` (identical code path). The DB run
+for `_batchfix` was on GPU 5 (n512 61.0, n1024 46.6, n2048 147.9, n4096 79.3 ms)
+— cross-GPU noise on the geqrf fallbacks; the head-to-head above is same-GPU (2).
+
+- **Faster on n512 (1.04x), tied on every other shape, no regressions** =>
+  promote, merge `--no-ff`.
+- Decision: **promote to active best.**
+- Next levers (iteration 15): the b640 n512 wall is now ~63 ms with the geqrf
+  repair gone; the remaining big compute pieces are the **Cholesky** (~18 ms over
+  the 3 shifted-CQR3 passes) and the **modified-LU reconstruction** (~15–18 ms).
+  Candidates: (a) **mixed-precision (BF16/FP16-input, FP32-accumulate) first
+  CholeskyQR pass** — the shift + 2 unshifted refinements + the now-robust
+  batched repair give headroom to tolerate a lower-precision first pass (must
+  hold both gates on all shapes + full stress); (b) the **n1024 Q-solve is still
+  on the library trsm** (`trsm_fused_max_n=768`) — re-probe a fused/coarser trsm
+  there; (c) the **small-batch large-n shapes (n2048/n4096)** still fall back to
+  geqrf — probe whether the fused Cholesky + custom trsm can beat geqrf at
+  batch<16.
 
 ## Iteration 13 — `cholqr3_shift_recon_bign` (extend fused Cholesky to n1024)
 
