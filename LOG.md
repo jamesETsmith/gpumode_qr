@@ -17,7 +17,22 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 ## Active variants
 
-- **`cholqr3_shift_recon`** (active best, iteration 11) — identical fused
+- **`cholqr3_shift_recon_invlu`** (active best, iteration 12) — identical
+  pipeline to `cholqr3_shift_recon` (shifted CholeskyQR3 + fused Cholesky/Q-solve
+  + shifted-repair) but the **modified-LU Householder reconstruction** replaces
+  its two per-block library `_trsm` solves with **batched GEMMs**. Iteration-12
+  profiling showed the reconstruction (~18 ms at b640 n512) was the largest
+  compute component and that within it the two trsm calls per block cost ~9 ms
+  while the `modlu_block` kernels cost only ~0.8 ms. The new
+  `modlu_inv_block` Triton kernel additionally emits the diagonal block's
+  `L11^{-1}` (unit lower) and `U11^{-1}` (upper, pivot diagonal) in-register, so
+  `L21 = A21 @ U11^{-1}` and `U12 = L11^{-1} @ B12` become batched GEMMs
+  (mathematically identical output; same BDGHKS sign / packing convention).
+  **New best on the priority shape: b640 n512 66.0 ms (vs 72.4 shift_recon ->
+  1.10x, vs geqrf 2572 -> 39x, same GPU 2); n352 8.17 ms (vs 8.45 -> 1.03x);
+  n1024 72.9 ms (vs 73.7, ~tie).** Fallback shapes (n<=256, batch<16) unchanged.
+  See iteration 12.
+- **`cholqr3_shift_recon`** (superseded by `_invlu`, iteration 11) — identical fused
   pipeline as `cholqr2_recon_fused3` (2 unshifted passes, fused Triton
   Cholesky/Q-solve gated to n<=768, fused modified-LU reconstruction) but the
   CholeskyQR2 is upgraded to **shifted CholeskyQR3** (Fukaya, Nakatsukasa,
@@ -149,6 +164,91 @@ Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
 
 +`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
 matches baseline there (small diffs are cross-GPU / run noise).
+
+## Iteration 12 — `cholqr3_shift_recon_invlu` (GEMM-only modified-LU reconstruction)
+
+- Branch: `variant/recon-fused-trsm` (merged `--no-ff` into `main`).
+- Direction (single, profile-driven): profile `cholqr3_shift_recon` at b640 n512
+  and n1024, find the largest remaining *compute* component, attack it.
+
+### 1. Profile of `cholqr3_shift_recon` (GPU 2, medians, ms)
+
+| component (ms)                     | b640 n512 | b60 n1024 |
+|------------------------------------|----------:|----------:|
+| A^T A + Q^T Q GEMMs (all)          |      4.5  |      3.3  |
+| Cholesky (shifted + 2 unshifted)   |     17.9  |     42.1  |
+| Q-solve (3 passes)                 |      9.2  |      7.2  |
+| ortho guard                        |      2.3  |      1.6  |
+| **modified-LU recon (modlu+R_stored)** | **18.7** |  15.0  |
+| geqrf repair (3 / 0 elts)          |     14.1  |      0.0  |
+| **SUM**                            |   **66.6**|  **69.2** |
+
+- At **b640 n512** the modified-LU reconstruction (~18.7 ms) is the largest
+  compute component (Cholesky ~17.9 close second). Sub-profiling the
+  reconstruction internals: the two per-block library `_trsm` calls cost
+  **9.1 ms** while the `modlu_block` kernels cost only **0.8 ms** (rest is the
+  trailing GEMM/slicing). The serialized library trsm is the target.
+- At **b60 n1024** the Cholesky (~42 ms) dominates (n1024 > the n<=768 fused
+  gate, so it runs the library blocked-256 Cholesky); the reconstruction trsm is
+  only ~3.6 ms there.
+
+### 2. Fix: fuse diagonal-block triangular inverses (GEMM-only off-diagonals)
+
+- New `modlu_inv_block` Triton kernel: same in-register modified-LU (BDGHKS,
+  one program per batch element) as `modlu_block`, then additionally builds
+  `L11^{-1}` (unit lower, row-forward substitution, unit diagonal) and
+  `U11^{-1}` (upper with pivot diagonal, row-backward substitution).
+- `_modified_lu_fused_inv` uses those inverses so the off-diagonal panel and row
+  solves become batched GEMMs: `L21 = A21 @ U11^{-1}`, `U12 = L11^{-1} @ B12`
+  (was `solve_triangular` / unit-lower left solve). No library trsm in the
+  reconstruction. Mathematically identical (same L\\U packing, same sign `s`).
+- New variant `cholqr3_shift_recon_invlu = make_cholqr_recon(passes=2,
+  lu_block=32, use_triton_modlu_inv=True, use_triton_chol=True, chol_kblock=64,
+  chol_fused_max_n=768, use_triton_trsm=True, trsm_kblock=64,
+  trsm_fused_max_n=768, shift=True, shift_coef=1.5)`. Everything except the
+  reconstruction's two solves is byte-for-byte `cholqr3_shift_recon`.
+
+### 3. Correctness
+
+- Isolation: block-kernel inverses `||L L^{-1} - I|| <= 3.1e-7`,
+  `||U U^{-1} - I|| <= 3.6e-7` for w in {16,31,32}, batch in {1,4,640}; sign
+  vectors **identical** to `modlu_block`. On the real pipeline's converged Q
+  (n=352/512/1024) the packed LU matches `_modified_lu_fused` to `<= 7.6e-6`
+  (rel `<= 3.8e-6`, pure FP32 noise), signs identical.
+- Harness: **PASS on all 7 benchmark shapes + the full stress suite.** b640 n512:
+  factor 1.17e-6 (gate 7.6e-5 bench), orth 1.07e-4 (gate 3.8e-4). All stress
+  cases (dense cond1/4, rank-deficient, near-rank-deficient, banded, row-scaled,
+  near-collinear, upper-triangular, clustered-scale at n=32/176/512) PASS with
+  wide margins.
+
+### 4. Performance (10 runs, same GPU 2 for a clean head-to-head)
+
+| shape           |    n | batch |  geqrf | cholqr3_shift_recon | cholqr3_shift_recon_invlu | vs shift_recon | vs geqrf |
+|-----------------|-----:|------:|-------:|--------------------:|--------------------------:|---------------:|---------:|
+| b20_n32_cond1   |   32 |    20 |   0.12 |               0.120 |                     0.121 | tie*           | tie*     |
+| b40_n176_cond1  |  176 |    40 |   1.4  |               1.656 |                     1.617 | tie*           | tie*     |
+| b40_n352_cond1  |  352 |    40 | 102    |               8.453 |                 **8.172** | 1.03x          | 12.5x    |
+| b640_n512_cond2 |  512 |   640 |2572    |              72.369 |                **65.955** | **1.10x**      | **39x**  |
+| b60_n1024_cond2 | 1024 |    60 | 523    |              73.725 |                **72.919** | ~tie           | 7.2x     |
+| b8_n2048_cond1  | 2048 |     8 | 151    |             170.520 |                   169.100 | tie*           | tie*     |
+| b2_n4096_cond1  | 4096 |     2 |  80    |              89.302 |                    88.361 | tie*           | tie*     |
+
+*n<=256 and batch<16 dispatch to `torch.geqrf` (identical code path); the DB
+run for `_invlu` was on GPU 5 (n512 64.4 ms, n2048 147.6 ms) — cross-GPU noise;
+the head-to-head above is same-GPU (GPU 2).
+
+- **Faster or tied on every shape, no regressions** => promote, merge `--no-ff`.
+- Decision: **promote to active best.**
+- Next levers (iteration 13): the priority b640 n512 wall is now ~66 ms; the two
+  remaining big compute pieces are the **Cholesky** (~18 ms at n512, and ~42 ms
+  the *dominant* term at n1024 where it falls to the library blocked-256 path),
+  and the ~14 ms serialized `geqrf` repair of the ~3 genuinely FP32-rank-deficient
+  elements. Options: (a) **mixed-precision (BF16/FP16-input, FP32-accumulate)
+  A^T A + trailing GEMMs** for the shifted first CholeskyQR pass (the shift + 2
+  unshifted refinements give robustness headroom — must hold both gates on all
+  shapes + full stress); (b) extend the fused Cholesky above n768 (or a coarser
+  fused block) to attack the n1024 Cholesky; (c) batch the residual geqrf repair
+  or fold those elements into a shifted re-solve.
 
 ## Iteration 11 — `cholqr3_shift_recon` (shifted CholeskyQR3, kills geqrf repair)
 
