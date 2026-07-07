@@ -175,7 +175,42 @@ def _batched_cholesky(G: torch.Tensor, block: int = 256) -> torch.Tensor:
     return torch.tril(L)
 
 
-def _choleskyqr(A: torch.Tensor, passes: int = 3, chol_block: int = 256):
+def _batched_cholesky_fused(G: torch.Tensor, block: int = 32) -> torch.Tensor:
+    """Right-looking blocked Cholesky (lower L, ``G = L L^T``) via a Triton kernel.
+
+    The only sequential-over-columns work is the ``w x w`` (``w = block <= 32``)
+    diagonal-block Cholesky, done by a Triton kernel with one program per batch
+    element (whole batch in parallel). The kernel also returns the diagonal
+    block's inverse ``L11^{-1}`` so the off-diagonal panel ``L21 = A21 L11^{-T}``
+    and the trailing update ``A22 -= L21 L21^T`` are batched GEMMs (no serialized
+    trsm). Mathematically identical to ``_batched_cholesky``.
+    """
+    from .triton_kernels import chol_inv_block
+
+    b, n, _ = G.shape
+    M = G.clone()
+    for k in range(0, n, block):
+        w = min(block, n - k)
+        blk = M[:, k:k + w, k:k + w].contiguous()
+        L11, L11inv = chol_inv_block(blk)
+        M[:, k:k + w, k:k + w] = L11
+        if k + w < n:
+            A21 = M[:, k + w:, k:k + w].contiguous()
+            # L21 = A21 @ L11^{-T} = A21 @ (L11inv)^T
+            L21 = A21 @ L11inv.transpose(-2, -1)
+            M[:, k + w:, k:k + w] = L21
+            M[:, k + w:, k + w:] = M[:, k + w:, k + w:] - L21 @ L21.transpose(-2, -1)
+    return torch.tril(M)
+
+
+def _choleskyqr(
+    A: torch.Tensor,
+    passes: int = 3,
+    chol_block: int = 256,
+    use_triton_chol: bool = False,
+    chol_kblock: int = 32,
+    chol_fused_max_n: int = 1_000_000,
+):
     """CholeskyQR with ``passes`` re-orthogonalizations (unshifted).
 
     Returns (Q, R) with A ~= Q R and Q numerically orthonormal. CholeskyQR2 is
@@ -187,13 +222,26 @@ def _choleskyqr(A: torch.Tensor, passes: int = 3, chol_block: int = 256):
     # the sign-based modified LU amplifies catastrophically). Elements whose
     # CholeskyQR fails to converge (ill-conditioned / non-PD) are detected and
     # replaced with torch.geqrf by the caller. cholesky_ex avoids raising.
+    # The custom blocked Cholesky has O(n/kblock) sequential Python-level steps
+    # (each a diagonal-block kernel + two batched GEMMs). Its win over the
+    # library path comes from removing rocSOLVER's batch serialization, which is
+    # only large enough to amortize that launch overhead up to n ~ 512; beyond
+    # that the library's coarse (block-256) blocking wins, so we gate on n.
+    n = A.shape[-1]
+    fused = use_triton_chol and n <= chol_fused_max_n
+
+    def _chol(M):
+        if fused:
+            return _batched_cholesky_fused(M, block=chol_kblock)
+        return _batched_cholesky(M, chol_block)
+
     G = A.transpose(-2, -1) @ A
-    R = _batched_cholesky(G, chol_block).transpose(-2, -1)
+    R = _chol(G).transpose(-2, -1)
     Q = _trsm(R, A, upper=True, left=False)
 
     for _ in range(passes - 1):
         G = Q.transpose(-2, -1) @ Q
-        Ri = _batched_cholesky(G, chol_block).transpose(-2, -1)
+        Ri = _chol(G).transpose(-2, -1)
         Q = _trsm(Ri, Q, upper=True, left=False)
         R = Ri @ R
     return Q, R
@@ -291,6 +339,9 @@ def make_cholqr_recon(
     chol_block: int = 256,
     lu_block: int = 64,
     use_triton_modlu: bool = False,
+    use_triton_chol: bool = False,
+    chol_kblock: int = 32,
+    chol_fused_max_n: int = 1_000_000,
 ) -> QRImpl:
     """CholeskyQR(k) + Householder reconstruction -> compact (H, tau).
 
@@ -308,7 +359,11 @@ def make_cholqr_recon(
         if n <= small_n or batch < min_batch:
             return torch.geqrf(A)
         try:
-            Q, _R = _choleskyqr(A, passes=passes, chol_block=chol_block)
+            Q, _R = _choleskyqr(
+                A, passes=passes, chol_block=chol_block,
+                use_triton_chol=use_triton_chol, chol_kblock=chol_kblock,
+                chol_fused_max_n=chol_fused_max_n,
+            )
 
             # Per-element guard: CholeskyQR can fail to produce an orthonormal Q
             # for ill-conditioned / near-rank-deficient elements. The checker
@@ -365,6 +420,17 @@ VARIANTS: dict[str, QRImpl] = {
     # trailing updates. See LOG.md iteration 8.
     "cholqr2_recon_fused": make_cholqr_recon(
         passes=2, lu_block=32, use_triton_modlu=True
+    ),
+    # Iteration 9: identical to ``cholqr2_recon_fused`` (2 passes, fused Triton
+    # modified-LU reconstruction) but the CholeskyQR term's batched Cholesky is
+    # also replaced by a custom right-looking blocked Cholesky whose diagonal
+    # w x w block factorization + inverse is a Triton kernel (one program per
+    # batch element), with the off-diagonal panel and trailing update as batched
+    # GEMM. Attacks the rocSOLVER/rocBLAS batch serialization that dominates the
+    # priority b640 n512 shape. See LOG.md iteration 9.
+    "cholqr2_recon_fused2": make_cholqr_recon(
+        passes=2, lu_block=32, use_triton_modlu=True,
+        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
     ),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
