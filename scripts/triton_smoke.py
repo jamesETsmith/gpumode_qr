@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """Minimal Triton smoke test on gfx950: does a trivial kernel compile+run?"""
+
 import torch
 import triton
 import triton.language as tl

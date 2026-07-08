@@ -40,8 +40,8 @@ class CheckResult:
     orth_residual: float
     orth_threshold: float
     orth_pass: bool
-    leakage: float          # lower-tri leakage of Q.T @ A (relative)
-    reconstruction: float   # ||Q@R - A||_1 / ||A||_1 (diagnostic)
+    leakage: float  # lower-tri leakage of Q.T @ A (relative)
+    reconstruction: float  # ||Q@R - A||_1 / ||A||_1 (diagnostic)
 
     @property
     def passed(self) -> bool:

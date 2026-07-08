@@ -19,8 +19,8 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import torch  # noqa: E402
 
-from qrbench.variants import _modified_lu, _modified_lu_fused  # noqa: E402
 from qrbench.triton_kernels import modlu_block  # noqa: E402
+from qrbench.variants import _modified_lu, _modified_lu_fused  # noqa: E402
 
 
 def rand_orthonormal(b, n, device, seed=0):

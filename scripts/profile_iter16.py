@@ -7,6 +7,7 @@ and compares fusion candidates for the sign-scale + triu + tril + add assembly
 (the Q^T A GEMM is kept — it is load-bearing for the tight factor gate).
 Dev-only profiler.
 """
+
 from __future__ import annotations
 
 import sys
@@ -16,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import torch  # noqa: E402
+
 from qrbench import inputs  # noqa: E402
 from qrbench.variants import _modified_lu_fused_inv  # noqa: E402
 
@@ -40,8 +42,7 @@ def tm(fn, warmup=5, iters=30):
 
 def profile(batch, n, cond):
     dev = "cuda"
-    prob = inputs.make_benchmark_problem(
-        {"batch": batch, "n": n, "cond": cond}, device=dev)
+    prob = inputs.make_benchmark_problem({"batch": batch, "n": n, "cond": cond}, device=dev)
     A = prob.tensor
     Q, _ = torch.linalg.qr(A)
     Q = Q.contiguous()
@@ -61,6 +62,7 @@ def profile(batch, n, cond):
         R_stored = torch.triu(su * (Qt @ A))
         H = torch.tril(B, -1) + R_stored
         return H
+
     t_cur = tm(cur)
 
     # candidate A: in-place triu_/tril_/add_ (no extra temporaries)
@@ -69,15 +71,18 @@ def profile(batch, n, cond):
         Bc = B.clone()
         H = Bc.tril_(-1).add_(QtA.triu_())
         return H
+
     t_a = tm(cand_inplace)
 
     # candidate B: single torch.where with a cached upper-incl-diag mask
     ridx = torch.arange(n, device=dev)
     upper = ridx[None, :] >= ridx[:, None]  # (n,n) col>=row
+
     def cand_where():
         QtA = (Qt @ A).mul_(su)
         H = torch.where(upper, QtA, B)
         return H
+
     t_b = tm(cand_where)
 
     # candidate B': where without the extra mul_ (fold sign into where operand)
@@ -85,20 +90,25 @@ def profile(batch, n, cond):
         QtA = Qt @ A
         H = torch.where(upper, su * QtA, B)
         return H
+
     t_b2 = tm(cand_where2)
 
     # candidate C: fused Triton assemble kernel (see below)
     from assemble_kernel import assemble_H
+
     def cand_triton():
         QtA = Qt @ A
         return assemble_H(QtA, B, s)
+
     H_tri = cand_triton()
     t_c = tm(cand_triton)
 
     # correctness: all candidates vs current
     Href = cur()
+
     def md(x):
         return (x - Href).abs().max().item()
+
     print(f"\n=== b{batch} n{n} cond{cond} ===")
     print(f"  modified-LU recon kernel     {t_modlu:8.3f}")
     print(f"  Q^T A GEMM alone             {t_gemm:8.3f}")

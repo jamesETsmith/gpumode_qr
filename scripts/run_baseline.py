@@ -19,9 +19,11 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 # The variant registry + metadata is torch-free, so ``--list`` works even on a
 # host without torch installed (no GPU needed to see the standings).
 from qrbench.variants import (  # noqa: E402
-    VARIANTS as _VARIANTS,
     CHAMPION,
     format_variant_list,
+)
+from qrbench.variants import (  # noqa: E402
+    VARIANTS as _VARIANTS,
 )
 
 BASELINE = "torch_geqrf"
@@ -31,7 +33,8 @@ ALL_IMPLS = sorted(set(_VARIANTS) | {BASELINE})
 # actual benchmarking paths; import them lazily so ``--list`` stays lightweight.
 try:  # pragma: no cover - trivial import guard
     import torch  # noqa: E402
-    from qrbench import inputs, checker, bench, dbwrite  # noqa: E402
+
+    from qrbench import bench, checker, dbwrite, inputs  # noqa: E402
     from qrbench.reference import REGISTRY as _REF_REGISTRY  # noqa: E402
 
     REGISTRY = {**_REF_REGISTRY, **_VARIANTS}
@@ -111,20 +114,18 @@ def run_benchmarks(
     return results
 
 
-def run_compare(
-    impls: list[str], device: str, warmup: int, iters: int, shapes: list[dict]
-) -> int:
+def run_compare(impls: list[str], device: str, warmup: int, iters: int, shapes: list[dict]) -> int:
     """Benchmark a set of variants over ``shapes`` and print a geomean ranking.
 
     No DB record is written (this is the interactive head-to-head path). Honors
     the single GPU selected via ``HIP_VISIBLE_DEVICES`` (``GPU=N`` in the
     wrappers); torch always sees it as device 0.
     """
-    print(f"device={torch.cuda.get_device_name(0)} torch={torch.__version__} "
-          f"hip={torch.version.hip}")
+    print(
+        f"device={torch.cuda.get_device_name(0)} torch={torch.__version__} hip={torch.version.hip}"
+    )
     shape_names = [f"b{s['batch']}_n{s['n']}_cond{s['cond']}" for s in shapes]
-    print(f"comparing {len(impls)} impls over {len(shapes)} shapes: "
-          f"{', '.join(shape_names)}\n")
+    print(f"comparing {len(impls)} impls over {len(shapes)} shapes: {', '.join(shape_names)}\n")
 
     summary: list[tuple[str, float, bool]] = []  # (impl, geomean_median, all_pass)
     for impl in impls:
@@ -144,8 +145,10 @@ def run_compare(
     for rank, (impl, gm, all_pass) in enumerate(summary, 1):
         champ = " \u2605" if impl == CHAMPION else ""
         ratio = f"{gm / best:.2f}x" if best and best == best else "-"
-        print(f"  {rank:>2} {impl + champ:<32} {gm:>20.4f} {ratio:>8}  "
-              f"{'PASS' if all_pass else 'FAIL'}")
+        print(
+            f"  {rank:>2} {impl + champ:<32} {gm:>20.4f} {ratio:>8}  "
+            f"{'PASS' if all_pass else 'FAIL'}"
+        )
     return 0 if all(p for _, _, p in summary) else 2
 
 
@@ -160,19 +163,23 @@ def main() -> int:
     ap.add_argument("--db-dir", default=str(REPO_ROOT / "db"))
     ap.add_argument("--no-write", action="store_true")
     ap.add_argument(
-        "--list", action="store_true",
+        "--list",
+        action="store_true",
         help="list every registered variant (description + status + champion); no GPU",
     )
     ap.add_argument(
-        "--compare", action="store_true",
+        "--compare",
+        action="store_true",
         help="benchmark a set of variants and print a geomean ranking (no DB write)",
     )
     ap.add_argument(
-        "--impls", default=None,
+        "--impls",
+        default=None,
         help="comma-separated impls for --compare (default: champion + torch_geqrf)",
     )
     ap.add_argument(
-        "--shapes", default=None,
+        "--shapes",
+        default=None,
         help="comma-separated shape names or n-values to benchmark (default: all 7)",
     )
     args = ap.parse_args()
@@ -183,8 +190,7 @@ def main() -> int:
         return 0
 
     if not _HAVE_TORCH:
-        print("ERROR: torch is not importable (run inside the ROCm container)",
-              file=sys.stderr)
+        print("ERROR: torch is not importable (run inside the ROCm container)", file=sys.stderr)
         return 1
     if not torch.cuda.is_available():
         print("ERROR: no GPU visible to torch", file=sys.stderr)
@@ -198,12 +204,13 @@ def main() -> int:
         unknown = [i for i in impls if i not in REGISTRY]
         if unknown:
             raise SystemExit(f"unknown impls for --compare: {unknown}")
-        return run_compare(impls, args.device, args.warmup, args.iters,
-                           select_shapes(args.shapes))
+        return run_compare(impls, args.device, args.warmup, args.iters, select_shapes(args.shapes))
 
     fn = REGISTRY[args.impl]
-    print(f"impl={args.impl} device={torch.cuda.get_device_name(0)} "
-          f"torch={torch.__version__} hip={torch.version.hip}")
+    print(
+        f"impl={args.impl} device={torch.cuda.get_device_name(0)} "
+        f"torch={torch.__version__} hip={torch.version.hip}"
+    )
 
     stress_results = []
     if args.stress:
@@ -220,12 +227,8 @@ def main() -> int:
     # runtimes (AGENTS.md ranks passing submissions by the geomean of benchmark
     # cases). We use per-shape median_ms as the case runtime; also record a
     # min_ms geomean as a best-case reference.
-    geomean_median_ms = bench.geomean(
-        [r["timing"]["median_ms"] for r in bench_results]
-    )
-    geomean_min_ms = bench.geomean(
-        [r["timing"]["min_ms"] for r in bench_results]
-    )
+    geomean_median_ms = bench.geomean([r["timing"]["median_ms"] for r in bench_results])
+    geomean_min_ms = bench.geomean([r["timing"]["min_ms"] for r in bench_results])
 
     if not args.no_write:
         meta = dbwrite.collect_metadata(str(REPO_ROOT), args.docker_image)

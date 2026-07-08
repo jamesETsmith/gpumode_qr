@@ -8,4 +8,4 @@ Modules:
 - dbwrite:   results DB writer (one JSON per run)
 """
 
-EPS32 = 2.0 ** -23  # float32 machine epsilon ~1.1920929e-07
+EPS32 = 2.0**-23  # float32 machine epsilon ~1.1920929e-07

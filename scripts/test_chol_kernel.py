@@ -5,6 +5,7 @@ Validates:
   1. chol_inv_block (the w x w diagonal-block Triton kernel) vs torch.
   2. _batched_cholesky_fused (blocked, GEMM trailing) vs torch.linalg.cholesky.
 """
+
 from __future__ import annotations
 
 import sys

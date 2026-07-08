@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """Iteration-16 isolation: fusedasm (H,tau) must match batchfix bit-for-bit."""
+
 from __future__ import annotations
 
 import sys
@@ -9,6 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import torch  # noqa: E402
+
 from qrbench import inputs  # noqa: E402
 from qrbench.variants import VARIANTS  # noqa: E402
 
@@ -27,8 +29,10 @@ for shape in [
     torch.cuda.synchronize()
     dh = (Hr - Hn).abs().max().item()
     dt = (tr - tn).abs().max().item()
-    print(f"b{shape['batch']} n{shape['n']}: maxdiff H {dh:.3e}  tau {dt:.3e}  "
-          f"{'EXACT' if dh == 0 and dt == 0 else 'DIFF'}")
+    print(
+        f"b{shape['batch']} n{shape['n']}: maxdiff H {dh:.3e}  tau {dt:.3e}  "
+        f"{'EXACT' if dh == 0 and dt == 0 else 'DIFF'}"
+    )
 
 # stress danger cases
 for n in (32, 176, 512):

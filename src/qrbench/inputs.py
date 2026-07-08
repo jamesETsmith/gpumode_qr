@@ -13,7 +13,6 @@ clustered-scale) and are used only for correctness gating, not ranking.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
 
 import torch
 
@@ -75,6 +74,7 @@ def make_benchmark_problem(
 # Stress cases (correctness only). Each returns a (batch, n, n) fp32 tensor.
 # --------------------------------------------------------------------------
 
+
 def _dense(batch, n, cond, g, device):
     a = torch.randn(batch, n, n, generator=g, device=device, dtype=torch.float32)
     scale = torch.logspace(0, -float(cond), n, device=device, dtype=torch.float32)
@@ -129,7 +129,7 @@ def stress_cases(
     # clustered-scale: two clusters of column magnitudes
     clustered = torch.randn(batch, n, n, generator=g, device=device, dtype=torch.float32)
     cscale = torch.ones(n, device=device, dtype=torch.float32)
-    cscale[n // 2:] = 1e-5
+    cscale[n // 2 :] = 1e-5
     add("clustered_scale", clustered * cscale, kind="clustered_scale")
 
     return out

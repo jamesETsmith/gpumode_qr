@@ -8,6 +8,7 @@ blocked right-solve against the chunked reference ``_trsm`` (plain
 orthonormality of the resulting Q = A R^{-1} across both passes end-to-end, and
 runs a triu-inverse identity check on the exact diagonal blocks used.
 """
+
 from __future__ import annotations
 
 import sys
@@ -20,7 +21,7 @@ import torch  # noqa: E402
 
 from qrbench import inputs  # noqa: E402
 from qrbench.triton_kernels import triu_inv_block  # noqa: E402
-from qrbench.variants import _trsm_right_upper_fused, _trsm, _choleskyqr  # noqa: E402
+from qrbench.variants import _choleskyqr  # noqa: E402
 
 
 def test_diag_inverse():
@@ -49,27 +50,28 @@ def test_pipeline():
         if n <= 256 or b < 16:
             continue
         A = inputs.make_benchmark_problem(shape, device=device).tensor
-        common = dict(passes=2, use_triton_chol=True, chol_kblock=64,
-                      chol_fused_max_n=768)
+        common = dict(passes=2, use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768)
         Qref, Rref = _choleskyqr(A, use_triton_trsm=False, **common)
-        Qf, Rf = _choleskyqr(A, use_triton_trsm=True, trsm_kblock=64,
-                             trsm_fused_max_n=768, **common)
+        Qf, Rf = _choleskyqr(
+            A, use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768, **common
+        )
         eye = torch.eye(n, device=device).expand(b, n, n)
         # CholeskyQR (no guard) leaves NaN/Inf on ill-conditioned elements that
         # the production per-element geqrf guard repairs. Compare only elements
         # where BOTH paths converged (finite), which is the meaningful set.
-        fin = (torch.isfinite(Qref).all(dim=(-2, -1))
-               & torch.isfinite(Qf).all(dim=(-2, -1)))
+        fin = torch.isfinite(Qref).all(dim=(-2, -1)) & torch.isfinite(Qf).all(dim=(-2, -1))
         nbad_r = (~torch.isfinite(Qref).all(dim=(-2, -1))).sum().item()
         nbad_f = (~torch.isfinite(Qf).all(dim=(-2, -1))).sum().item()
         Qfg, Qrg = Qf[fin], Qref[fin]
         relQ = ((Qfg - Qrg).norm() / Qrg.norm()).item()
-        eyf = eye[:Qfg.shape[0]]
+        eyf = eye[: Qfg.shape[0]]
         orth_f = (Qfg.transpose(-2, -1) @ Qfg - eyf).abs().amax(dim=(-2, -1)).max().item()
         orth_r = (Qrg.transpose(-2, -1) @ Qrg - eyf).abs().amax(dim=(-2, -1)).max().item()
-        print(f"  n={n:4d} b={b:4d}  finite={fin.sum().item()}/{b} "
-              f"(bad ref={nbad_r} fused={nbad_f})  ||Qf-Qref||/||Qref||={relQ:.2e} "
-              f"orth_f={orth_f:.2e} orth_ref={orth_r:.2e}")
+        print(
+            f"  n={n:4d} b={b:4d}  finite={fin.sum().item()}/{b} "
+            f"(bad ref={nbad_r} fused={nbad_f})  ||Qf-Qref||/||Qref||={relQ:.2e} "
+            f"orth_f={orth_f:.2e} orth_ref={orth_r:.2e}"
+        )
 
 
 if __name__ == "__main__":
