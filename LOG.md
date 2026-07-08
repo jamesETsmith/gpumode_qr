@@ -32,10 +32,14 @@ runtime. Current standings (from existing db files, MI350X / ROCm 7.2.4):
 | `torch_geqrf` (baseline)        |            42.9948 |            1.00x |
 | `cholqr3_shift_recon_repair2`   |            12.4341 |            3.46x |
 | `hh_fused_smalln`               |            11.5208 |            3.73x |
-| `hh_panel_gemm` (**champion**)  |             3.0081 |           14.29x |
+| `hh_panel_gemm` (iter 19)       |             3.0081 |           14.29x |
+| `hh_panel_tuned` (**champion**, iter 21) |     3.0000 |          14.33x |
 
 So the current best variant is ~**14.3x** faster than the geqrf baseline on the
 geomean metric — a **3.8x** jump over the prior `hh_fused_smalln` champion. The
+iteration-21 `hh_panel_tuned` autotunes the panel kernel's launch config
+(`num_warps=4` at n352/n512) for a small, no-regression win over `hh_panel_gemm`
+(n512 7.83 → 7.02 ms, geomean 3.01 → 3.00 ms). The
 iteration-19 fused Householder **panel + batched-GEMM** route replaces the
 CholeskyQR shift/recon/repair pipeline on every `n>128` shape (b640 n512 ~58 →
 ~7.8 ms, n1024 ~46 → ~8.0, n2048 ~148 → ~16, n4096 ~87 → ~41), being direct
@@ -46,7 +50,24 @@ in the iteration-19 entry / `db/` remains the real story.)
 
 ## Active variants
 
-- **`hh_panel_gemm`** (active best / champion, iteration 19) — a **Triton port
+- **`hh_panel_tuned`** (active best / champion, iteration 21) — the iteration-19
+  `hh_panel_gemm` engine with the panel kernel's **launch config autotuned per
+  benchmark shape** (`scripts/hh_panel_tune.py` swept panel width `w` × Triton
+  `num_warps` × `num_stages`, measuring full end-to-end median + both gates).
+  **Byte-identical numerics/kernels** to `hh_panel_gemm`; only the launch config
+  changes. The width sweep confirmed the champion widths were already optimal
+  (wider panels spill catastrophically at large `r`: n4096 w=32 → ~219 ms vs
+  w=16 → ~41 ms), so the **only** win is **`num_warps=4`** at the two large-batch
+  mid-size shapes n352 (b40) / n512 (b640), where the default
+  `BLOCK_R>128 → num_warps=8` heuristic over-subscribes warps: same-GPU-2 10/10
+  **n512 7.83 → 7.02 ms (1.12x)**, n352 1.56 → 1.50 ms. n1024/n2048/n4096 keep
+  the champion's per-panel heuristic (fall through → **no regression**), and
+  arbitrary non-benchmark `(B,n)` fall back to the width heuristic + default
+  `num_warps` so they still work/pass. **geomean(median) 3.01 → 3.00 ms;** both
+  gates + full 27-case stress PASS (residuals identical to `hh_panel_gemm`). See
+  iteration 21.
+- **`hh_panel_gemm`** (base engine; superseded as champion by `hh_panel_tuned`
+  in iter 21, iteration 19) — a **Triton port
   of the NVIDIA seed's fused Householder PANEL + batched-GEMM-trailing** blocked
   QR. For every `n>128` shape it factors each width-`w` panel of the trailing
   matrix with a fully-fused per-matrix kernel (`hh_panel_qr`), reusing the
@@ -300,6 +321,106 @@ Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
 
 +`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
 matches baseline there (small diffs are cross-GPU / run noise).
+
+## Iteration 21 — `hh_panel_tuned` (per-shape panel-width × num_warps autotune)
+
+- Branch: `variant/hh-panel-tuned` (merged `--no-ff` into `main`).
+- Direction (single, bounded): systematically tune the fused-Householder panel
+  route's **launch config** per benchmark shape — panel width `w` × Triton
+  `num_warps` (× `num_stages`) — to cut end-to-end time **without changing
+  numerics**. Motivated by the iteration-19/20 note that the panel kernel's
+  `num_warps` is a fixed `4 if BLOCK_R<=128 else 8` heuristic and the width has a
+  sharp register-spill cliff (why w=16 was picked for n≥2048).
+
+### 1. Implementation
+
+- `hh_panel_qr` (`triton_kernels.py`) gains optional `num_warps` / `num_stages`
+  knobs (`None` → the historical heuristic). `_hh_panel_blocked_qr`
+  (`variants.py`) threads them to every panel launch. Both are pure launch-config
+  knobs — the factorization math is untouched.
+- `scripts/hh_panel_tune.py`: for each shape, sweeps `(w, num_warps, num_stages)`
+  building a temp impl (`_hh_panel_blocked_qr(A, w, tf32=False, num_warps=nw)`),
+  validates **both FP64 gates** on the actual benchmark input, and reports the
+  end-to-end median (warmup 8-10, iters 12-20).
+- New variant `hh_panel_tuned = make_hh_panel_tuned(panel_min_n=128)` with a
+  per-`n` `(w, num_warps, num_stages)` table; shapes not in the table fall back
+  to the champion's width heuristic + default `num_warps` (robust for arbitrary
+  `(B,n)`). `n≤128` → `hh_fused_smalln` exactly as the champion.
+
+### 2. Sweep results (same-GPU per shape; widths 8-64, num_warps 2-16, stages 1)
+
+Best `num_warps` per width (PASS-only). **Bold** = chosen.
+
+| shape (n, batch)   | best config        | median_ms | vs champion heuristic |
+|--------------------|--------------------|----------:|----------------------:|
+| n352  (b40)        | **w=32, warps=4**  |  **1.48** | 1.56 (warps=8) → 1.05x|
+| n512  (b640)       | **w=32, warps=4**  |  **6.96** | 7.83 (warps=8) → 1.12x|
+| n1024 (b60)        | w=32, warps=8      |  8.07     | 8.03 heuristic (≈tie) |
+| n2048 (b8)         | w=16, warps=8      | 16.41     | 16.6 (≈tie)           |
+| n4096 (b2)         | w=16, warps=8      | 41.15     | 41.0 (≈tie)           |
+
+- **Width is already optimal.** Wider panels spill at large `r`: n1024
+  w=48/64 @ warps=2 → 56-69 ms; **n2048** w=24 → 62-431 ms, w=48 → 132 ms (vs
+  w=16 16.4); **n4096** w=24 → 425-901 ms, w=32 → 219-256 ms, w=48 → 700+ ms (vs
+  w=16 41). So the champion's w=32(≤1024)/w=16(≥2048) split is confirmed.
+- **The only real win is `num_warps`.** At the two large-batch mid-size shapes
+  (n352 b40, n512 b640) the default `BLOCK_R>128 → warps=8` over-subscribes the
+  kernel; **warps=4** is a clear win (n512: warps=2 8.72, **warps=4 6.96**,
+  warps=8 8.11, warps=16 9.57). At n1024/n2048/n4096 the champion's *per-panel*
+  heuristic (8 for big-`r` panels, 4 for the small-`r` tail) already ties or
+  beats any fixed `num_warps`, so those shapes are intentionally **not**
+  overridden (chosen table = `{352:(32,4), 512:(32,4)}`; everything else falls
+  through to the champion path → zero regression risk). `num_stages>1` was not
+  beneficial (kept 1).
+
+### 3. Correctness
+
+- `--impl hh_panel_tuned --stress` (GPU 2): **ALL 7 benchmark shapes + the FULL
+  27-case stress suite PASS both FP64 gates**, residuals **identical** to
+  `hh_panel_gemm` (n512 factor 5.0e-7 / orth 1.7e-5; upper_triangular exact 0.0).
+  Numerics are unchanged by construction (launch-config only).
+
+### 4. Performance — same-GPU-2 head-to-head, 10/10 (`--compare`)
+
+| shape           |    n | batch | `hh_panel_gemm` | **`hh_panel_tuned`** |     Δ |
+|-----------------|-----:|------:|----------------:|---------------------:|------:|
+| b20_n32_cond1   |   32 |    20 |  0.053 | 0.053 | tie (shared fused path) |
+| b40_n176_cond1  |  176 |    40 |  0.781 | 0.765 | tie (same path, noise)  |
+| b40_n352_cond1  |  352 |    40 |  1.562 | **1.497** | **1.04x** |
+| b640_n512_cond2 |  512 |   640 |  7.829 | **7.022** | **1.12x** |
+| b60_n1024_cond2 | 1024 |    60 |  8.033 | 8.087 | tie (same path)  |
+| b8_n2048_cond1  | 2048 |     8 | 16.948 | 16.917 | tie (same path) |
+| b2_n4096_cond1  | 4096 |     2 | 41.082 | 41.155 | tie (same path) |
+| **geomean(median)** | | | **3.116** | **3.038** | **1.03x** |
+
+- Detached 10/10 DB run (GPU 5): geomean(median) **3.000 ms**
+  (`db/20260708T044736Z_hh_panel_tuned.json`), **14.33x vs the geqrf baseline**
+  (geqrf same-GPU-2 geomean 47.07 ms). n512 6.97 ms, n2048 16.37, n4096 41.0.
+- **≥ champion on every shape (no regression), faster on n352/n512** — the
+  n1024/n2048/n4096 shapes are literally the `hh_panel_gemm` code path (warps
+  heuristic + same widths), so the ≈-ties are the same kernel, not a regression.
+
+### 5. Decision
+
+- **PROMOTE to champion + merge `--no-ff`.** Small but genuine, no-regression
+  win (n512 1.12x, geomean 3.01 → 3.00 ms) with all gates + full stress PASS.
+  The bounded tuning direction is **closed**: the panel widths were already
+  optimal (confirmed by the spill cliff), and the sole launch-config lever is
+  `num_warps=4` at the large-batch mid-size shapes.
+
+### 6. Recommendation for iteration 22
+
+- **LDS-resident wider-panel HIP kernel** for n2048/n4096: the register-spill
+  cliff is now *quantified* (n4096 w=24 → 425-901 ms, w=32 → 219 ms, all ≫ w=16
+  41 ms; n2048 similar) — a `load_inline` HIP panel that holds the panel in LDS
+  could allow wider `w` (fewer trailing-GEMM passes) without the in-register
+  spill, the most likely remaining win on the two small-batch large-n shapes
+  (occupancy-bound at B=2/8).
+- **bf16 trailing GEMM** re-test: direct-Householder R has headroom the retired
+  CholeskyQR path lacked; could ~2x the large-n trailing GEMMs if the gate holds
+  (needs column-normalization to keep bf16 error small).
+- **Fuse the trailing `Vᵀ C` / `V Wᵀ` update into the panel kernel** for the
+  first/narrow trailing block, cutting a batched-GEMM + memory pass per panel.
 
 ## Iteration 19 — `hh_panel_gemm` (fused Householder PANEL + batched-GEMM trailing)
 

@@ -6,9 +6,15 @@ Variants are registered in ``VARIANTS`` and merged into the run registry.
 
 Which one is best?
 ------------------
-The **current champion is** ``hh_panel_gemm`` (marked by the module-level
-``CHAMPION`` constant): a **fused Householder panel + batched-GEMM trailing**
-blocked QR (Triton port of the NVIDIA seed's large-``n`` strategy). For every
+The **current champion is** ``hh_panel_tuned`` (marked by the module-level
+``CHAMPION`` constant): the iteration-19 ``hh_panel_gemm`` engine with the panel
+kernel's launch config (panel width ``w`` x Triton ``num_warps``) **autotuned
+per benchmark shape** (iteration 21). It is byte-identical in numerics to
+``hh_panel_gemm``; the only change is ``num_warps=4`` at n352/n512 (n512
+7.83 -> 7.02 ms, 1.12x), with every other shape falling through to the
+``hh_panel_gemm`` path (no regression). The underlying engine is a
+**fused Householder panel + batched-GEMM trailing** blocked QR (Triton port of
+the NVIDIA seed's large-``n`` strategy). For every
 ``n>128`` shape it factors each width-``w`` panel with a fully-fused per-matrix
 kernel (reusing the iteration-18 in-register Householder inner loop as
 ``panel_core``, building the compact-WY ``T`` in-kernel) and applies the block
@@ -65,6 +71,14 @@ Lineage (how we got to the champion)
    reconstruction / shift-repair). Beats the CholeskyQR champion on **every**
    large shape (geomean 11.52 -> ~3.01 ms, ~14.3x vs geqrf); ``n<=128`` still
    uses ``hh_fused_smalln``.
+9. ``hh_panel_tuned`` (**champion**) — ``hh_panel_gemm`` with the panel kernel's
+   launch config (panel width ``w`` x Triton ``num_warps``) autotuned per shape
+   (``scripts/hh_panel_tune.py``). Same numerics/kernels; the width sweep
+   confirmed the champion widths were already optimal, and the only win is
+   ``num_warps=4`` at the large-batch mid-size shapes n352/n512 (the default
+   ``BLOCK_R>128 -> num_warps=8`` heuristic over-subscribes warps there): n512
+   7.83 -> 7.02 ms (1.12x), n352 1.56 -> 1.50 ms; geomean ~3.01 -> ~3.00 ms.
+   All other shapes fall through to the ``hh_panel_gemm`` path (no regression).
 
 See ``LOG.md`` for the full per-iteration reasoning and measurements.
 """
@@ -89,7 +103,7 @@ QRImpl = Callable[..., tuple]
 
 # The single explicit "current best" marker. Kept in sync with LOG.md's active
 # best and the leaderboard geomean (see scripts/plot_results.py).
-CHAMPION = "hh_panel_gemm"
+CHAMPION = "hh_panel_tuned"
 
 _matmul_tf32_enabled: bool | None = None
 
@@ -744,7 +758,13 @@ def make_hh_fused_smalln(cap: int = 128, base: QRImpl | None = None) -> QRImpl:
     return impl
 
 
-def _hh_panel_blocked_qr(A: torch.Tensor, panel_w: int, tf32: bool):
+def _hh_panel_blocked_qr(
+    A: torch.Tensor,
+    panel_w: int,
+    tf32: bool,
+    num_warps: int | None = None,
+    num_stages: int = 1,
+):
     """Blocked Householder QR via the fused Triton panel kernel + GEMM trailing.
 
     Right-looking blocked QR (iteration 19 / NVIDIA-seed port): for each width-
@@ -755,8 +775,11 @@ def _hh_panel_blocked_qr(A: torch.Tensor, panel_w: int, tf32: bool):
     GEMMs ``C -= V @ (Tᵀ @ (Vᵀ @ C))``. Returns geqrf-format ``(H, tau)``.
 
     ``tf32`` selects the trailing GEMM precision (TF32 when True, IEEE FP32
-    otherwise). Being direct Householder, this is unconditionally stable — no
-    ``AᵀA`` conditioning, no reconstruction, no shift/repair.
+    otherwise). ``num_warps`` / ``num_stages`` are the panel kernel's launch
+    config (``None`` warps => the historical heuristic); they change nothing
+    numerically (iteration 21 autotune). Being direct Householder, this is
+    unconditionally stable — no ``AᵀA`` conditioning, no reconstruction, no
+    shift/repair.
     """
     from .triton_kernels import hh_panel_qr
 
@@ -768,7 +791,7 @@ def _hh_panel_blocked_qr(A: torch.Tensor, panel_w: int, tf32: bool):
     for j0 in range(0, n, W):
         w = min(W, n - j0)
         panel = H[:, j0:, j0 : j0 + w].contiguous()
-        Hp, V, ptau, T = hh_panel_qr(panel)
+        Hp, V, ptau, T = hh_panel_qr(panel, num_warps=num_warps, num_stages=num_stages)
         H[:, j0:, j0 : j0 + w] = Hp
         tau[:, j0 : j0 + w] = ptau
         c = n - (j0 + w)
@@ -824,6 +847,70 @@ def make_hh_panel_gemm(
             return _hh_panel_blocked_qr(a, w, tf32)
         # Restore IEEE FP32 before the champion path so a prior panel call's TF32
         # toggle never leaks into the CholeskyQR/geqrf shapes.
+        _set_matmul_tf32(False)
+        return _base(A)
+
+    return impl
+
+
+_PANEL_TUNE_BY_N: dict[int, tuple[int, int, int]] = {
+    # (panel width w, num_warps, num_stages) autotuned per benchmark shape by
+    # scripts/hh_panel_tune.py (iteration 21). Numerics are identical to the
+    # champion — only the panel kernel's launch config changes.
+    #
+    # The width sweep confirmed the champion's widths are already optimal (w=32
+    # for n<=1024, w=16 for n>=2048 — wider spills catastrophically at big r,
+    # e.g. n4096 w=32 -> ~219 ms vs w=16 -> ~41 ms). The only launch-config win
+    # is **num_warps=4** at the two large-batch mid-size shapes (n352 b40,
+    # n512 b640), where the champion's ``BLOCK_R>128 -> num_warps=8`` heuristic
+    # over-subscribes warps: n512 7.83 -> 7.02 ms (1.12x), n352 1.56 -> 1.50 ms.
+    # For n1024/n2048/n4096 the champion's per-panel heuristic (8 for big-r
+    # panels, 4 for the small-r tail) already beats any fixed num_warps, so those
+    # shapes are intentionally NOT overridden here (fall through to the champion
+    # path -> zero regression risk).
+    352: (32, 4, 1),
+    512: (32, 4, 1),
+}
+
+
+def make_hh_panel_tuned(
+    panel_min_n: int = 128,
+    tune_by_n: dict[int, tuple[int, int, int]] | None = None,
+    width_by_n: dict[int, int] | None = None,
+    default_w: int = _PANEL_W_DEFAULT,
+    tf32: bool = False,
+    base: QRImpl | None = None,
+) -> QRImpl:
+    """Autotuned fused Householder panel + GEMM-trailing blocked QR (iteration 21).
+
+    Byte-identical numerics to the iteration-19 champion ``hh_panel_gemm`` (same
+    ``hh_panel_qr`` panel kernel + the three batched GEMMs per panel); the ONLY
+    difference is the panel kernel's per-shape launch config — panel width ``w``
+    and Triton ``num_warps`` (and ``num_stages``) — swept per benchmark shape by
+    ``scripts/hh_panel_tune.py`` and stored in ``tune_by_n``. For shapes not in
+    the table (arbitrary ``(B, n)``) it falls back to the champion's width
+    heuristic (``width_by_n`` / ``default_w``) and the kernel's default
+    ``num_warps`` heuristic, so every shape still works and passes.
+
+    Dispatch: ``n > panel_min_n`` uses the panel route; ``n <= panel_min_n``
+    falls through to ``base`` (the fused small-n engine), exactly as the champion.
+    """
+    _base = base if base is not None else make_hh_fused_smalln(cap=128)
+    _tune = dict(_PANEL_TUNE_BY_N if tune_by_n is None else tune_by_n)
+    _width_by_n = dict(_PANEL_W_BY_N if width_by_n is None else width_by_n)
+
+    def impl(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        n = A.shape[-1]
+        if n > panel_min_n:
+            a = A if A.is_contiguous() else A.contiguous()
+            cfg = _tune.get(n)
+            if cfg is not None:
+                w, num_warps, num_stages = cfg[0], cfg[1], (cfg[2] if len(cfg) > 2 else 1)
+            else:
+                # Robust fallback for non-benchmark shapes: width heuristic +
+                # the panel kernel's built-in num_warps heuristic.
+                w, num_warps, num_stages = _panel_width_for_n(n, _width_by_n, default_w), None, 1
+            return _hh_panel_blocked_qr(a, w, tf32, num_warps=num_warps, num_stages=num_stages)
         _set_matmul_tf32(False)
         return _base(A)
 
@@ -1063,6 +1150,12 @@ VARIANTS: dict[str, QRImpl] = {
     # ``panel_shapes`` gates which benchmark shapes use the panel route; the rest
     # fall through to the champion so no shape can regress. See LOG iter 19.
     "hh_panel_gemm": make_hh_panel_gemm(panel_min_n=128),
+    # Iteration 21: byte-identical numerics/kernels to hh_panel_gemm, but the
+    # panel kernel's launch config (panel width w x Triton num_warps) is
+    # autotuned per benchmark shape (scripts/hh_panel_tune.py). Non-benchmark
+    # shapes fall back to the champion's width heuristic + default num_warps.
+    # See LOG iter 21.
+    "hh_panel_tuned": make_hh_panel_tuned(panel_min_n=128),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
     "blocked_wy_b96": make_blocked_wy(96),
@@ -1149,6 +1242,10 @@ VARIANT_INFO: dict[str, VariantInfo] = {
     ),
     "hh_panel_gemm": VariantInfo(
         "fused Householder panel (Triton) + batched-GEMM trailing; direct-HH, no repair",
+        "active",
+    ),
+    "hh_panel_tuned": VariantInfo(
+        "hh_panel_gemm with per-shape autotuned panel width x num_warps launch config",
         "active",
     ),
     "blocked_wy_b32": VariantInfo(
