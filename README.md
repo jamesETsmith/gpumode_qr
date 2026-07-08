@@ -60,8 +60,9 @@ container so the results DB has correct provenance.
 
 ## Comparing implementations / which is fastest
 
-The current **champion** (best leaderboard geomean) is
-`cholqr3_shift_recon_repair2`, marked by the `CHAMPION` constant in
+The current **champion** (best leaderboard geomean) is `hh_panel_tuned` (a
+blocked Householder panel + batched-GEMM QR; geomean(median) ≈ 3.00 ms, ~14.33x
+vs `torch.geqrf`; `b640 n512` ≈ 7 ms), marked by the `CHAMPION` constant in
 `src/qrbench/variants.py`. Three commands make the comparison easy:
 
 ```bash
@@ -78,7 +79,7 @@ uv run --with matplotlib python scripts/plot_results.py
 GPU=1 scripts/in_container.sh python scripts/run_baseline.py --compare
 # choose impls / shapes explicitly:
 GPU=1 scripts/in_container.sh python scripts/run_baseline.py --compare \
-  --impls cholqr3_shift_recon_repair2,cholqr2_recon,torch_geqrf --shapes 512,1024
+  --impls hh_panel_tuned,hh_panel_gemm,torch_geqrf --shapes 512,1024
 # detached (survives disconnects):
 GPU=2 scripts/run_detached.sh python -u scripts/run_baseline.py --compare
 ```
