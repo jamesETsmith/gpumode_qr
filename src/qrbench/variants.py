@@ -6,9 +6,13 @@ Variants are registered in ``VARIANTS`` and merged into the run registry.
 
 Which one is best?
 ------------------
-The **current champion is** ``cholqr3_shift_recon_repair2`` (marked by the
-module-level ``CHAMPION`` constant). It has the best leaderboard geomean of the
-per-shape medians (~12.43 ms, ~3.46x vs the ``torch_geqrf`` baseline). Use
+The **current champion is** ``hh_fused_smalln`` (marked by the module-level
+``CHAMPION`` constant): a fused single-block Householder QR (Triton) for
+``n<=128`` layered on top of ``cholqr3_shift_recon_repair2`` (which it calls
+unchanged for every larger shape). It has the best leaderboard geomean of the
+per-shape medians (~11.52 ms, ~3.7x vs the ``torch_geqrf`` baseline), improving
+on ``cholqr3_shift_recon_repair2`` (~12.43 ms) purely via the ~2.2x small-n
+(b20 n32) win. Use
 ``python scripts/run_baseline.py --list`` to see every variant with its
 one-line description and status, and ``scripts/plot_results.py`` for the
 geomean leaderboard computed from ``db/``.
@@ -35,10 +39,16 @@ Lineage (how we got to the champion)
    fused-Cholesky gate for n1024 (``_bign``), a batched shifted-CQR repair of the
    residual bad elements (``_batchfix``), and a fused R-assembly kernel
    (``_fusedasm``).
-6. ``cholqr3_shift_recon_repair2`` (**champion**) — ``_fusedasm`` with one fewer
-   unshifted refinement pass in the batched repair (``repair_passes`` 3 -> 2),
-   which is still under every correctness gate but cheaper on the b640 n512
-   repair sub-batch.
+6. ``cholqr3_shift_recon_repair2`` — ``_fusedasm`` with one fewer unshifted
+   refinement pass in the batched repair (``repair_passes`` 3 -> 2), which is
+   still under every correctness gate but cheaper on the b640 n512 repair
+   sub-batch. (Now the base engine wrapped by the champion for n>128.)
+7. ``hh_fused_smalln`` (**champion**) — a Triton port of the NVIDIA seed's
+   fully-fused per-matrix Householder QR (one program/matrix, whole matrix in
+   registers, geqrf packing, no library geqrf / trailing GEMM). Dispatches
+   ``n<=128`` to the fused kernel (~2.2x over geqrf on b20 n32) and everything
+   above to ``cholqr3_shift_recon_repair2`` unchanged. Foundational: de-risks
+   the in-register fused-Householder primitive for the larger panel + GEMM port.
 
 See ``LOG.md`` for the full per-iteration reasoning and measurements.
 """
@@ -63,7 +73,7 @@ QRImpl = Callable[..., tuple]
 
 # The single explicit "current best" marker. Kept in sync with LOG.md's active
 # best and the leaderboard geomean (see scripts/plot_results.py).
-CHAMPION = "cholqr3_shift_recon_repair2"
+CHAMPION = "hh_fused_smalln"
 
 
 def make_blocked_householder(block: int = 64) -> QRImpl:
@@ -995,11 +1005,11 @@ VARIANT_INFO: dict[str, VariantInfo] = {
         "killed",
     ),
     "cholqr3_shift_recon_repair2": VariantInfo(
-        "fusedasm with lighter batched repair (repair_passes 3->2); best geomean",
+        "fusedasm + lighter batched repair; base engine for hh_fused_smalln (n>128)",
         "active",
     ),
     "hh_fused_smalln": VariantInfo(
-        "fused single-block Householder QR for small n (Triton), champion above n=128",
+        "fused single-block Householder QR (Triton) for n<=128; champion engine above",
         "active",
     ),
     "blocked_wy_b32": VariantInfo(
