@@ -830,6 +830,108 @@ def plot_branch_history(runs: list[Run], dag: GitDag, out_path: Path) -> Path:
     return out_path.resolve()
 
 
+def plot_geomean_over_iterations(runs: list[Run], out_path: Path) -> Path:
+    """Leaderboard geomean improving over the research iterations.
+
+    x-axis is chronological iteration order (each variant placed at the date of
+    its latest db result, consistent with the per-shape perf figure's ordering);
+    y-axis is the geometric mean of the 7 per-shape ``median_ms`` (log-y). Draws:
+
+    - the ``torch_geqrf`` baseline geomean as a dashed reference line,
+    - each variant's own geomean as a labeled scatter point,
+    - the *best-so-far* geomean as a descending step line, and
+    - an annotation on the final best with its speedup vs the baseline.
+
+    Only variants with all benchmark shapes are shown (partial runs are excluded
+    via :func:`build_leaderboard`'s ``complete`` flag).
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = build_leaderboard(runs)
+    baseline_row = next((r for r in rows if r.impl == BASELINE_IMPL), None)
+    baseline_geomean = baseline_row.geomean_median_ms if baseline_row else None
+
+    # Non-baseline complete variants, ordered chronologically by their latest run
+    # date (research-iteration order); ties broken by geomean.
+    variants = [r for r in rows if r.complete and r.impl != BASELINE_IMPL]
+    variants.sort(key=lambda r: (r.date, r.geomean_median_ms))
+
+    fig, ax = plt.subplots(figsize=(max(10.0, 0.85 * len(variants) + 3.0), 6.0))
+
+    if not variants:
+        ax.text(0.5, 0.5, "no complete-shape variants to plot",
+                ha="center", va="center", transform=ax.transAxes)
+        fig.tight_layout()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=130)
+        plt.close(fig)
+        return out_path.resolve()
+
+    xs = list(range(len(variants)))
+    ys = [r.geomean_median_ms for r in variants]
+
+    # best-so-far (cumulative minimum) as a step line
+    best_so_far: list[float] = []
+    cur = float("inf")
+    for y in ys:
+        cur = min(cur, y)
+        best_so_far.append(cur)
+    ax.step(
+        xs, best_so_far, where="post", color="tab:blue", linewidth=1.8,
+        zorder=2, label="best-so-far geomean",
+    )
+
+    # each variant's own geomean point, labeled
+    ax.scatter(xs, ys, color="tab:orange", s=60, zorder=3, label="variant geomean")
+    for x, y, r in zip(xs, ys, variants):
+        ax.annotate(
+            r.impl.replace("cholqr", "cqr").replace("blocked_", "b_"),
+            (x, y), textcoords="offset points", xytext=(5, 6),
+            fontsize=7, rotation=25, color="0.2", zorder=4,
+        )
+
+    if baseline_geomean is not None:
+        ax.axhline(
+            baseline_geomean, color="0.35", linestyle="--", linewidth=1.2,
+            zorder=1, label=f"{BASELINE_IMPL} baseline ({baseline_geomean:.2f} ms)",
+        )
+
+    # annotate the final best with its speedup vs baseline
+    best = variants[min(range(len(ys)), key=lambda i: ys[i])]
+    if baseline_geomean is not None and best.geomean_median_ms > 0:
+        speedup = baseline_geomean / best.geomean_median_ms
+        bx = xs[variants.index(best)]
+        ax.annotate(
+            f"best: {best.impl}\n{best.geomean_median_ms:.2f} ms  ({speedup:.2f}x vs baseline)",
+            (bx, best.geomean_median_ms),
+            textcoords="offset points", xytext=(10, -34),
+            fontsize=9, fontweight="bold", color="tab:blue",
+            arrowprops=dict(arrowstyle="->", color="tab:blue", lw=1.2), zorder=6,
+        )
+
+    ax.set_yscale("log")
+    ax.set_ylabel("geomean of per-shape median_ms (log, lower is better)", fontsize=9)
+    ax.set_xlabel("research iteration (chronological order of variant's latest result)", fontsize=9)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([f"{i}" for i in xs], fontsize=8)
+    ax.grid(True, which="both", axis="y", alpha=0.25)
+    ax.margins(x=0.06)
+    ax.set_title(
+        "Leaderboard geomean over research iterations "
+        "(geomean of 7 per-shape medians; lower is better)",
+        fontsize=12,
+    )
+    ax.legend(fontsize=8, loc="best")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    return out_path.resolve()
+
+
 def generate_all(repo: str | Path) -> list[Path]:
     """Load data + git history and write both figures under ``<repo>/plots``.
 
@@ -849,6 +951,12 @@ def generate_all(repo: str | Path) -> list[Path]:
     # Kept as an extra overview: the combined small-multiples grid.
     written.append(
         plot_performance_over_time(runs, plots_dir / "perf_over_time.png")
+    )
+    # Leaderboard geomean improving over the research iterations.
+    written.append(
+        plot_geomean_over_iterations(
+            runs, plots_dir / "geomean_over_iterations.png"
+        )
     )
 
     dag = load_git_dag(repo)

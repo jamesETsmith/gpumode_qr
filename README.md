@@ -55,6 +55,36 @@ GPU=2 scripts/run_detached.sh python -u scripts/run_baseline.py --impl torch_geq
 `scripts/in_container.sh` forwards the git commit and docker image into the
 container so the results DB has correct provenance.
 
+## Comparing implementations / which is fastest
+
+The current **champion** (best leaderboard geomean) is
+`cholqr3_shift_recon_repair2`, marked by the `CHAMPION` constant in
+`src/qrbench/variants.py`. Three commands make the comparison easy:
+
+```bash
+# 1. List every registered variant with a one-line description + status, with a
+#    ★ on the champion. No GPU needed.
+python scripts/run_baseline.py --list
+
+# 2. Current standings from existing db/ files (geomean of per-shape median_ms
+#    + speedup vs the torch_geqrf baseline). No GPU / no rerun.
+uv run --with matplotlib python scripts/plot_results.py
+
+# 3. Live head-to-head: benchmark a set of variants and rank by geomean(median).
+#    Default set is champion + baseline; no DB record is written.
+GPU=1 scripts/in_container.sh python scripts/run_baseline.py --compare
+# choose impls / shapes explicitly:
+GPU=1 scripts/in_container.sh python scripts/run_baseline.py --compare \
+  --impls cholqr3_shift_recon_repair2,cholqr2_recon,torch_geqrf --shapes 512,1024
+# detached (survives disconnects):
+GPU=2 scripts/run_detached.sh python -u scripts/run_baseline.py --compare
+```
+
+`--compare` honors the single GPU selected via `GPU=N` (i.e.
+`HIP_VISIBLE_DEVICES`) and prints a table ranked fastest-first by the geomean of
+the per-shape medians. The zero-GPU `plot_results.py` leaderboard remains the
+quick way to see current standings without rerunning anything.
+
 ## Plots
 
 Two figures visualize progress; plotting only needs **matplotlib** (no
@@ -73,6 +103,11 @@ uv run --with matplotlib python scripts/plot_results.py
   a dashed reference line, and correctness failures are marked with a red `x`.
 - `plots/perf_over_time.png` — the same data as a combined small-multiples grid
   (one subplot per shape), kept as a quick at-a-glance overview.
+- `plots/geomean_over_iterations.png` — the leaderboard geomean (geometric mean
+  of the 7 per-shape medians) improving over the research iterations: each
+  variant's own geomean as a labeled point, the best-so-far as a step line, the
+  `torch_geqrf` baseline as a dashed reference, and the final best annotated
+  with its speedup vs the baseline. Only variants with all 7 shapes are shown.
 - `plots/branch_history.png` — the git DAG rendered as branch lanes over time
   (`main` on top, each `variant/<name>` in its own lane), with merge commits
   marked as diamonds and benchmark results overlaid on the commit that produced

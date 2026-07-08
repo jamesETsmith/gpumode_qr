@@ -2,19 +2,68 @@
 
 Each variant is a callable ``fn(A) -> (H, tau)`` returning compact Householder
 factors in the ``torch.geqrf`` convention, so the same checker/harness applies.
-
 Variants are registered in ``VARIANTS`` and merged into the run registry.
+
+Which one is best?
+------------------
+The **current champion is** ``cholqr3_shift_recon_repair2`` (marked by the
+module-level ``CHAMPION`` constant). It has the best leaderboard geomean of the
+per-shape medians (~12.43 ms, ~3.46x vs the ``torch_geqrf`` baseline). Use
+``python scripts/run_baseline.py --list`` to see every variant with its
+one-line description and status, and ``scripts/plot_results.py`` for the
+geomean leaderboard computed from ``db/``.
+
+Lineage (how we got to the champion)
+------------------------------------
+1. ``blocked_hh``  — right-looking blocked Householder (panel geqrf + ormqr
+   trailing update). Slower than the baseline on the geomean; killed.
+2. ``blocked_wy``  — same panel geqrf but a compact-WY (Schreiber-Van Loan)
+   trailing update via batched GEMM instead of ormqr. Modest win; killed once
+   CholeskyQR overtook it.
+3. ``cholqr2_recon`` — switch strategy entirely: CholeskyQR (batched GEMM +
+   Cholesky) for an orthonormal Q, then a BDGHKS modified-LU reconstruction of
+   genuine Householder factors. Blocking + narrower LU panels (``_blk``) sped it
+   up.
+4. Fused Triton kernels — replace the launch-bound sequential inner loops with
+   one-program-per-batch-element diagonal-block kernels: fused modified-LU
+   (``_fused``), fused blocked Cholesky (``_fused2``), fused triangular solve
+   (``_fused3``). Each removed a rocSOLVER/rocBLAS batch-serialization
+   bottleneck.
+5. Shifted CholeskyQR3 (``cholqr3_shift_*``) — a shifted first Cholesky pass on
+   ``A^T A + sI`` makes ill-conditioned dense elements converge (no serialized
+   ``geqrf`` repair), then GEMM-based modified-LU inverses (``_invlu``), a raised
+   fused-Cholesky gate for n1024 (``_bign``), a batched shifted-CQR repair of the
+   residual bad elements (``_batchfix``), and a fused R-assembly kernel
+   (``_fusedasm``).
+6. ``cholqr3_shift_recon_repair2`` (**champion**) — ``_fusedasm`` with one fewer
+   unshifted refinement pass in the batched repair (``repair_passes`` 3 -> 2),
+   which is still under every correctness gate but cheaper on the b640 n512
+   repair sub-batch.
+
+See ``LOG.md`` for the full per-iteration reasoning and measurements.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
-
-import torch
 
 from . import EPS32
 
-QRImpl = Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
+# torch is only needed to *run* the variants (i.e. on the GPU host / container),
+# not to import the module or list the registry. Guarding the import keeps the
+# torch-free tooling paths working -- notably ``run_baseline.py --list`` and the
+# metadata below -- on hosts without torch installed.
+try:  # pragma: no cover - trivial import guard
+    import torch
+except ModuleNotFoundError:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+
+QRImpl = Callable[..., tuple]
+
+# The single explicit "current best" marker. Kept in sync with LOG.md's active
+# best and the leaderboard geomean (see scripts/plot_results.py).
+CHAMPION = "cholqr3_shift_recon_repair2"
 
 
 def make_blocked_householder(block: int = 64) -> QRImpl:
@@ -738,3 +787,124 @@ VARIANTS: dict[str, QRImpl] = {
     "blocked_wy_b96": make_blocked_wy(96),
     "blocked_wy_b128": make_blocked_wy(128),
 }
+
+
+# ---------------------------------------------------------------------------
+# Human-facing registry: one-line description + status per variant.
+# ---------------------------------------------------------------------------
+#
+# ``status`` is one of:
+#   "active"       - on the current development front (the champion is active)
+#   "killed"       - superseded / removed from active development (kept for
+#                    provenance + head-to-head history)
+#   "experimental" - a knob sweep or probe, not a serious contender
+#
+# The baseline ``torch_geqrf`` lives in ``reference.py`` but is described here
+# too so ``--list`` can show the whole registry in one place.
+
+
+@dataclass(frozen=True)
+class VariantInfo:
+    description: str
+    status: str  # active | killed | experimental | baseline
+
+
+VARIANT_INFO: dict[str, VariantInfo] = {
+    "torch_geqrf": VariantInfo(
+        "rocSOLVER batched geqrf baseline (correct everywhere, slow at large n)",
+        "baseline",
+    ),
+    "blocked_hh_b64": VariantInfo(
+        "right-looking blocked Householder (panel geqrf + ormqr trailing update)",
+        "killed",
+    ),
+    "cholqr2_recon": VariantInfo(
+        "CholeskyQR2 + BDGHKS modified-LU Householder reconstruction",
+        "killed",
+    ),
+    "cholqr2_recon_blk": VariantInfo(
+        "cholqr2_recon with narrower LU panel (block 32, 2 passes)",
+        "killed",
+    ),
+    "cholqr2_recon_fused": VariantInfo(
+        "cholqr2_recon_blk + fused Triton modified-LU diagonal-block kernel",
+        "killed",
+    ),
+    "cholqr2_recon_fused2": VariantInfo(
+        "+ fused Triton blocked Cholesky (diagonal-block factor+inverse)",
+        "killed",
+    ),
+    "cholqr2_recon_fused3": VariantInfo(
+        "+ fused Triton triangular solve for the Q-forming right-solve",
+        "killed",
+    ),
+    "cholqr3_shift_recon": VariantInfo(
+        "shifted CholeskyQR3 (A^T A + sI) so ill-conditioned elements converge",
+        "killed",
+    ),
+    "cholqr3_shift_recon_invlu": VariantInfo(
+        "+ GEMM-based modified-LU via diagonal-block inverses (L11^-1, U11^-1)",
+        "killed",
+    ),
+    "cholqr3_shift_recon_bign": VariantInfo(
+        "+ fused blocked Cholesky gate raised to n<=1024 (covers n1024 shape)",
+        "killed",
+    ),
+    "cholqr3_shift_recon_batchfix": VariantInfo(
+        "+ batched shifted-CQR repair of residual bad elements (no serial geqrf)",
+        "killed",
+    ),
+    "cholqr3_shift_recon_fusedasm": VariantInfo(
+        "+ fused single-pass Triton R-assembly (sign-scale + triu/tril + add)",
+        "killed",
+    ),
+    "cholqr3_shift_recon_repair2": VariantInfo(
+        "fusedasm with lighter batched repair (repair_passes 3->2); best geomean",
+        "active",
+    ),
+    "blocked_wy_b32": VariantInfo(
+        "blocked Householder with compact-WY (batched GEMM) trailing update, block 32",
+        "killed",
+    ),
+    "blocked_wy_b64": VariantInfo("compact-WY blocked Householder, block 64", "experimental"),
+    "blocked_wy_b96": VariantInfo("compact-WY blocked Householder, block 96", "experimental"),
+    "blocked_wy_b128": VariantInfo("compact-WY blocked Householder, block 128", "experimental"),
+}
+
+
+def describe_variants() -> list[tuple[str, VariantInfo, bool]]:
+    """Return ``(name, info, is_champion)`` for every registered impl.
+
+    Champion first, then active, experimental, killed, and finally the baseline;
+    within a group, alphabetical. Any impl lacking explicit info gets a
+    placeholder so nothing is silently dropped. Torch-free (safe for ``--list``).
+    """
+    names = set(VARIANTS) | set(VARIANT_INFO) | {"torch_geqrf"}
+    order = {"active": 0, "experimental": 1, "killed": 2, "baseline": 3}
+
+    def info_for(name: str) -> VariantInfo:
+        return VARIANT_INFO.get(name, VariantInfo("(no description)", "experimental"))
+
+    def sort_key(name: str):
+        return (0 if name == CHAMPION else 1, order.get(info_for(name).status, 9), name)
+
+    return [(n, info_for(n), n == CHAMPION) for n in sorted(names, key=sort_key)]
+
+
+def format_variant_list() -> str:
+    """Render :func:`describe_variants` as a compact text table for ``--list``."""
+    rows = describe_variants()
+    lines = ["Registered QR implementations (\u2605 = current champion):", ""]
+    name_w = max((len(n) for n, _, _ in rows), default=12)
+    for name, info, is_champ in rows:
+        marker = "\u2605" if is_champ else " "
+        lines.append(f"  {marker} {name:<{name_w}}  [{info.status:^12}]  {info.description}")
+    lines.append("")
+    lines.append(f"Champion: {CHAMPION}  (best leaderboard geomean of per-shape medians)")
+    lines.append(
+        "Compare live:   python scripts/run_baseline.py --compare        (champion + baseline)"
+    )
+    lines.append(
+        "Standings only: python scripts/plot_results.py                  (geomean table from db/, no GPU)"
+    )
+    return "\n".join(lines)
