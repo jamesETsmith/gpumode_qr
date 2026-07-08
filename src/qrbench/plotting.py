@@ -839,7 +839,7 @@ def plot_geomean_over_iterations(runs: list[Run], out_path: Path) -> Path:
     variants = [r for r in rows if r.complete and r.impl != BASELINE_IMPL]
     variants.sort(key=lambda r: (r.date, r.geomean_median_ms))
 
-    fig, ax = plt.subplots(figsize=(max(10.0, 0.85 * len(variants) + 3.0), 6.0))
+    fig, ax = plt.subplots(figsize=(max(10.0, 0.85 * len(variants) + 3.0), 6.8))
 
     if not variants:
         ax.text(
@@ -858,6 +858,10 @@ def plot_geomean_over_iterations(runs: list[Run], out_path: Path) -> Path:
 
     xs = list(range(len(variants)))
     ys = [r.geomean_median_ms for r in variants]
+    # Abbreviated variant names, reused for the x tick labels so each point is
+    # self-identifying (avoids readers mistaking the tick index for an
+    # "iteration number").
+    tick_labels = [r.impl.replace("cholqr", "cqr").replace("blocked_", "b_") for r in variants]
 
     # best-so-far (cumulative minimum) as a step line
     best_so_far: list[float] = []
@@ -875,19 +879,9 @@ def plot_geomean_over_iterations(runs: list[Run], out_path: Path) -> Path:
         label="best-so-far geomean",
     )
 
-    # each variant's own geomean point, labeled
+    # each variant's own geomean point (names now live on the x ticks, so no
+    # per-point name annotations here to avoid double-clutter)
     ax.scatter(xs, ys, color="tab:orange", s=60, zorder=3, label="variant geomean")
-    for x, y, r in zip(xs, ys, variants):
-        ax.annotate(
-            r.impl.replace("cholqr", "cqr").replace("blocked_", "b_"),
-            (x, y),
-            textcoords="offset points",
-            xytext=(5, 6),
-            fontsize=7,
-            rotation=25,
-            color="0.2",
-            zorder=4,
-        )
 
     if baseline_geomean is not None:
         ax.axhline(
@@ -918,9 +912,9 @@ def plot_geomean_over_iterations(runs: list[Run], out_path: Path) -> Path:
 
     ax.set_yscale("log")
     ax.set_ylabel("geomean of per-shape median_ms (log, lower is better)", fontsize=9)
-    ax.set_xlabel("research iteration (chronological order of variant's latest result)", fontsize=9)
+    ax.set_xlabel("variant (chronological order; last = current champion)", fontsize=9)
     ax.set_xticks(xs)
-    ax.set_xticklabels([f"{i}" for i in xs], fontsize=8)
+    ax.set_xticklabels(tick_labels, fontsize=7, rotation=40, ha="right")
     ax.grid(True, which="both", axis="y", alpha=0.25)
     ax.margins(x=0.06)
     ax.set_title(
