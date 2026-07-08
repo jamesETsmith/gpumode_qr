@@ -50,6 +50,10 @@ in the iteration-19 entry / `db/` remains the real story.)
 
 ## Active variants
 
+> **Maintenance note.** `docs/champion_kernel.md` is a teaching-style walkthrough
+> of the *current* champion (`hh_panel_tuned`). Refresh it whenever a new champion
+> is promoted so its description and results table stay accurate.
+
 - **`hh_panel_tuned`** (active best / champion, iteration 21) — the iteration-19
   `hh_panel_gemm` engine with the panel kernel's **launch config autotuned per
   benchmark shape** (`scripts/hh_panel_tune.py` swept panel width `w` × Triton

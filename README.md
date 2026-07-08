@@ -5,7 +5,9 @@ GPUs (AMD Instinct MI350X, `gfx950`, ROCm 7.2.4).
 
 See [`SUMMARY.md`](SUMMARY.md) for a short (<300-word) summary of where the
 project stands, and [`AGENTS.md`](AGENTS.md) for the full task description,
-rules, and the official benchmark shapes.
+rules, and the official benchmark shapes. See
+[`docs/champion_kernel.md`](docs/champion_kernel.md) for a teaching-style
+walkthrough of the current best kernel.
 
 ## Task in one paragraph
 
