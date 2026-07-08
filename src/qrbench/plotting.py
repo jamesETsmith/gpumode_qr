@@ -44,8 +44,8 @@ class Run:
     """One benchmark run (one db/*.json file)."""
 
     impl: str
-    git_commit: str          # normalized (``-dirty`` suffix stripped)
-    raw_commit: str          # as written in the file
+    git_commit: str  # normalized (``-dirty`` suffix stripped)
+    raw_commit: str  # as written in the file
     dirty: bool
     date: datetime
     path: Path
@@ -130,8 +130,8 @@ def load_results(db_dir: str | Path) -> list[Run]:
 class VariantHistory:
     impl: str
     first_seen: datetime
-    commits: list[str]                       # normalized commit hashes, ordered
-    best_median_ms: dict[str, float]         # shape name -> best (min) median
+    commits: list[str]  # normalized commit hashes, ordered
+    best_median_ms: dict[str, float]  # shape name -> best (min) median
     runs: int
 
 
@@ -253,9 +253,7 @@ def build_leaderboard(runs: Iterable[Run]) -> list[LeaderboardRow]:
     baseline_geomean: float | None = None
     base_run = latest.get(BASELINE_IMPL)
     if base_run is not None and expected.issubset(base_run.shapes.keys()):
-        baseline_geomean = _geomean(
-            base_run.shapes[name].median_ms for name in expected
-        )
+        baseline_geomean = _geomean(base_run.shapes[name].median_ms for name in expected)
 
     rows: list[LeaderboardRow] = []
     for impl, run in latest.items():
@@ -289,8 +287,7 @@ def format_leaderboard(rows: list[LeaderboardRow]) -> str:
     """Render :func:`build_leaderboard` output as a compact text table."""
     lines: list[str] = []
     lines.append(
-        "Leaderboard (geomean of per-shape median_ms; "
-        "lower is better; speedup vs torch_geqrf):"
+        "Leaderboard (geomean of per-shape median_ms; lower is better; speedup vs torch_geqrf):"
     )
     header = f"  {'variant':<30} {'geomean(median) ms':>20} {'speedup':>10}  shapes"
     lines.append(header)
@@ -302,15 +299,9 @@ def format_leaderboard(rows: list[LeaderboardRow]) -> str:
         else:
             speed = "(partial)"
             shapes = f"{r.n_shapes}/{r.n_expected}*"
-        lines.append(
-            f"  {r.impl:<30} {r.geomean_median_ms:>20.4f} {speed:>10}  {shapes}"
-        )
-    lines.append(
-        "  * partial: run does not cover all benchmark shapes; not ranked."
-    )
-    lines.append(
-        "  assumption: per-shape median_ms is the case runtime for the geomean."
-    )
+        lines.append(f"  {r.impl:<30} {r.geomean_median_ms:>20.4f} {speed:>10}  {shapes}")
+    lines.append("  * partial: run does not cover all benchmark shapes; not ranked.")
+    lines.append("  assumption: per-shape median_ms is the case runtime for the geomean.")
     return "\n".join(lines)
 
 
@@ -332,15 +323,13 @@ class Commit:
 
 @dataclass
 class GitDag:
-    commits: dict[str, Commit]          # sha -> Commit
-    order: list[str]                    # shas, newest-first (git log order)
-    lanes: list[str]                    # lane (branch) names, main first
+    commits: dict[str, Commit]  # sha -> Commit
+    order: list[str]  # shas, newest-first (git log order)
+    lanes: list[str]  # lane (branch) names, main first
 
 
 def _git(args: list[str], repo: Path) -> str:
-    return subprocess.check_output(
-        ["git", *args], cwd=repo, text=True, stderr=subprocess.DEVNULL
-    )
+    return subprocess.check_output(["git", *args], cwd=repo, text=True, stderr=subprocess.DEVNULL)
 
 
 def load_git_dag(repo: str | Path) -> GitDag | None:
@@ -390,9 +379,7 @@ def load_git_dag(repo: str | Path) -> GitDag | None:
 
     # Enumerate local branches (main first, then the rest).
     try:
-        branch_out = _git(
-            ["for-each-ref", "--format=%(refname:short)", "refs/heads"], repo
-        )
+        branch_out = _git(["for-each-ref", "--format=%(refname:short)", "refs/heads"], repo)
     except subprocess.CalledProcessError:
         branch_out = ""
     branches = [b.strip() for b in branch_out.splitlines() if b.strip()]
@@ -423,9 +410,7 @@ def load_git_dag(repo: str | Path) -> GitDag | None:
     for sha, commit in commits.items():
         if sha in trunk:
             continue
-        candidates = [
-            b for b in branches if b != "main" and sha in branch_sets[b]
-        ]
+        candidates = [b for b in branches if b != "main" and sha in branch_sets[b]]
         if candidates:
             commit.lane = min(candidates, key=lambda b: (branch_size[b], b))
         elif "main" in branch_sets and sha in branch_sets["main"]:
@@ -441,9 +426,7 @@ def load_git_dag(repo: str | Path) -> GitDag | None:
         if cur is None or c.date < cur:
             earliest[c.lane] = c.date
     lanes = ["main"] if "main" in used else []
-    lanes += sorted(
-        (l for l in used if l != "main"), key=lambda l: earliest[l]
-    )
+    lanes += sorted((l for l in used if l != "main"), key=lambda l: earliest[l])
 
     return GitDag(commits=commits, order=order, lanes=lanes)
 
@@ -470,9 +453,7 @@ def _variant_style(impls: list[str]):
     others = [i for i in impls if i != BASELINE_IMPL]
     cmap = mpl.colormaps["tab10"]
     colors = [cmap(i % cmap.N) for i in range(max(len(others), 1))]
-    style: dict[str, dict] = {
-        BASELINE_IMPL: dict(color="0.35", marker="o", linestyle="--")
-    }
+    style: dict[str, dict] = {BASELINE_IMPL: dict(color="0.35", marker="o", linestyle="--")}
     for idx, impl in enumerate(others):
         style[impl] = dict(
             color=colors[idx % len(colors)],
@@ -484,9 +465,7 @@ def _variant_style(impls: list[str]):
 
 def _shape_subtitle(runs: list[Run], shape_name: str) -> str:
     """``n=.., batch=.., cond=..`` string for a shape (empty if unknown)."""
-    sr_example = next(
-        (r.shapes[shape_name] for r in runs if shape_name in r.shapes), None
-    )
+    sr_example = next((r.shapes[shape_name] for r in runs if shape_name in r.shapes), None)
     if sr_example is None:
         return ""
     return f"n={sr_example.n}, batch={sr_example.batch}, cond={sr_example.cond}"
@@ -606,15 +585,11 @@ def plot_performance_over_time(runs: list[Run], out_path: Path) -> Path:
 
     ncols = 3
     nrows = (len(shapes) + ncols - 1) // ncols
-    fig, axes = plt.subplots(
-        nrows, ncols, figsize=(5.2 * ncols, 3.6 * nrows), squeeze=False
-    )
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 3.6 * nrows), squeeze=False)
 
     for idx, shape_name in enumerate(shapes):
         ax = axes[idx // ncols][idx % ncols]
-        _draw_shape_axis(
-            ax, runs, shape_name, impls, style, x_of_run, labels
-        )
+        _draw_shape_axis(ax, runs, shape_name, impls, style, x_of_run, labels)
         subtitle = _shape_subtitle(runs, shape_name)
         ax.set_title(f"{shape_name}\n{subtitle}", fontsize=9)
 
@@ -673,8 +648,7 @@ def plot_performance_per_shape(runs: list[Run], plots_dir: Path) -> list[Path]:
         )
         subtitle = _shape_subtitle(runs, shape_name)
         ax.set_title(
-            f"{shape_name}  ({subtitle})\n"
-            "median runtime over runs (log-y, lower is better)",
+            f"{shape_name}  ({subtitle})\nmedian runtime over runs (log-y, lower is better)",
             fontsize=12,
         )
         ax.set_xlabel("run index (chronological / commit order)", fontsize=9)
@@ -820,8 +794,14 @@ def plot_branch_history(runs: list[Run], dag: GitDag, out_path: Path) -> Path:
     handles, lbls = ax.get_legend_handles_labels()
     uniq = dict(zip(lbls, handles))
     if uniq:
-        ax.legend(uniq.values(), uniq.keys(), fontsize=8, loc="center left",
-                  title="benchmark result impl", framealpha=0.9)
+        ax.legend(
+            uniq.values(),
+            uniq.keys(),
+            fontsize=8,
+            loc="center left",
+            title="benchmark result impl",
+            framealpha=0.9,
+        )
     fig.autofmt_xdate(rotation=25)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -862,8 +842,14 @@ def plot_geomean_over_iterations(runs: list[Run], out_path: Path) -> Path:
     fig, ax = plt.subplots(figsize=(max(10.0, 0.85 * len(variants) + 3.0), 6.0))
 
     if not variants:
-        ax.text(0.5, 0.5, "no complete-shape variants to plot",
-                ha="center", va="center", transform=ax.transAxes)
+        ax.text(
+            0.5,
+            0.5,
+            "no complete-shape variants to plot",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
         fig.tight_layout()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=130)
@@ -880,8 +866,13 @@ def plot_geomean_over_iterations(runs: list[Run], out_path: Path) -> Path:
         cur = min(cur, y)
         best_so_far.append(cur)
     ax.step(
-        xs, best_so_far, where="post", color="tab:blue", linewidth=1.8,
-        zorder=2, label="best-so-far geomean",
+        xs,
+        best_so_far,
+        where="post",
+        color="tab:blue",
+        linewidth=1.8,
+        zorder=2,
+        label="best-so-far geomean",
     )
 
     # each variant's own geomean point, labeled
@@ -889,14 +880,23 @@ def plot_geomean_over_iterations(runs: list[Run], out_path: Path) -> Path:
     for x, y, r in zip(xs, ys, variants):
         ax.annotate(
             r.impl.replace("cholqr", "cqr").replace("blocked_", "b_"),
-            (x, y), textcoords="offset points", xytext=(5, 6),
-            fontsize=7, rotation=25, color="0.2", zorder=4,
+            (x, y),
+            textcoords="offset points",
+            xytext=(5, 6),
+            fontsize=7,
+            rotation=25,
+            color="0.2",
+            zorder=4,
         )
 
     if baseline_geomean is not None:
         ax.axhline(
-            baseline_geomean, color="0.35", linestyle="--", linewidth=1.2,
-            zorder=1, label=f"{BASELINE_IMPL} baseline ({baseline_geomean:.2f} ms)",
+            baseline_geomean,
+            color="0.35",
+            linestyle="--",
+            linewidth=1.2,
+            zorder=1,
+            label=f"{BASELINE_IMPL} baseline ({baseline_geomean:.2f} ms)",
         )
 
     # annotate the final best with its speedup vs baseline
@@ -907,9 +907,13 @@ def plot_geomean_over_iterations(runs: list[Run], out_path: Path) -> Path:
         ax.annotate(
             f"best: {best.impl}\n{best.geomean_median_ms:.2f} ms  ({speedup:.2f}x vs baseline)",
             (bx, best.geomean_median_ms),
-            textcoords="offset points", xytext=(10, -34),
-            fontsize=9, fontweight="bold", color="tab:blue",
-            arrowprops=dict(arrowstyle="->", color="tab:blue", lw=1.2), zorder=6,
+            textcoords="offset points",
+            xytext=(10, -34),
+            fontsize=9,
+            fontweight="bold",
+            color="tab:blue",
+            arrowprops=dict(arrowstyle="->", color="tab:blue", lw=1.2),
+            zorder=6,
         )
 
     ax.set_yscale("log")
@@ -949,21 +953,13 @@ def generate_all(repo: str | Path) -> list[Path]:
     # Primary output: one standalone figure per benchmark shape.
     written.extend(plot_performance_per_shape(runs, plots_dir))
     # Kept as an extra overview: the combined small-multiples grid.
-    written.append(
-        plot_performance_over_time(runs, plots_dir / "perf_over_time.png")
-    )
+    written.append(plot_performance_over_time(runs, plots_dir / "perf_over_time.png"))
     # Leaderboard geomean improving over the research iterations.
-    written.append(
-        plot_geomean_over_iterations(
-            runs, plots_dir / "geomean_over_iterations.png"
-        )
-    )
+    written.append(plot_geomean_over_iterations(runs, plots_dir / "geomean_over_iterations.png"))
 
     dag = load_git_dag(repo)
     if dag is not None:
-        written.append(
-            plot_branch_history(runs, dag, plots_dir / "branch_history.png")
-        )
+        written.append(plot_branch_history(runs, dag, plots_dir / "branch_history.png"))
     else:
         print("WARNING: could not read git history; skipping branch figure")
 

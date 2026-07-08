@@ -48,12 +48,15 @@ import triton.language as tl
 
 @triton.jit
 def _modlu_block_kernel(
-    A_ptr,        # (B, w, w) diagonal blocks, factored in place
-    s_ptr,        # (B, w) output sign vector
-    b,            # batch size
-    w,            # actual block width (<= BLOCK)
-    stride_ab, stride_ai, stride_aj,
-    stride_sb, stride_sj,
+    A_ptr,  # (B, w, w) diagonal blocks, factored in place
+    s_ptr,  # (B, w) output sign vector
+    b,  # batch size
+    w,  # actual block width (<= BLOCK)
+    stride_ab,
+    stride_ai,
+    stride_aj,
+    stride_sb,
+    stride_sj,
     BLOCK: tl.constexpr,
 ):
     """Modified-LU (no pivot) of one ``w x w`` block per program.
@@ -120,9 +123,15 @@ def modlu_block(blocks: torch.Tensor):
     s = torch.empty(b, w, device=blocks.device, dtype=blocks.dtype)
     grid = (b,)
     _modlu_block_kernel[grid](
-        LU, s, b, w,
-        LU.stride(0), LU.stride(1), LU.stride(2),
-        s.stride(0), s.stride(1),
+        LU,
+        s,
+        b,
+        w,
+        LU.stride(0),
+        LU.stride(1),
+        LU.stride(2),
+        s.stride(0),
+        s.stride(1),
         BLOCK=BLOCK,
     )
     return LU, s
@@ -147,16 +156,23 @@ def modlu_block(blocks: torch.Tensor):
 
 @triton.jit
 def _modlu_inv_block_kernel(
-    A_ptr,        # (B, w, w) diagonal blocks, factored in place
-    s_ptr,        # (B, w) output sign vector
-    Li_ptr,       # (B, w, w) L^{-1} (unit lower), output
-    Ui_ptr,       # (B, w, w) U^{-1} (upper, pivot diagonal), output
-    b,            # batch size
-    w,            # actual block width (<= BLOCK)
-    stride_ab, stride_ai, stride_aj,
-    stride_sb, stride_sj,
-    stride_lib, stride_lii, stride_lij,
-    stride_uib, stride_uii, stride_uij,
+    A_ptr,  # (B, w, w) diagonal blocks, factored in place
+    s_ptr,  # (B, w) output sign vector
+    Li_ptr,  # (B, w, w) L^{-1} (unit lower), output
+    Ui_ptr,  # (B, w, w) U^{-1} (upper, pivot diagonal), output
+    b,  # batch size
+    w,  # actual block width (<= BLOCK)
+    stride_ab,
+    stride_ai,
+    stride_aj,
+    stride_sb,
+    stride_sj,
+    stride_lib,
+    stride_lii,
+    stride_lij,
+    stride_uib,
+    stride_uii,
+    stride_uij,
     BLOCK: tl.constexpr,
 ):
     """Modified-LU of one ``w x w`` block + its diagonal triangular inverses.
@@ -209,9 +225,7 @@ def _modlu_inv_block_kernel(
         if i < w:
             is_ir = rows == i
             # strict-lower row of L (unit diagonal): keep cols < i
-            Lrow = tl.sum(
-                tl.where(is_ir[:, None] & (cols < i)[None, :], tile, 0.0), axis=0
-            )
+            Lrow = tl.sum(tl.where(is_ir[:, None] & (cols < i)[None, :], tile, 0.0), axis=0)
             contrib = tl.where((rows < i)[:, None], Lrow[:, None] * Linv, 0.0)
             acc = tl.sum(contrib, axis=0)
             ei = tl.where(cols == i, 1.0, 0.0)
@@ -228,9 +242,7 @@ def _modlu_inv_block_kernel(
         i = BLOCK - 1 - ii
         if i < w:
             is_ir = rows == i
-            Urow = tl.sum(
-                tl.where(is_ir[:, None] & (cols >= i)[None, :], tile, 0.0), axis=0
-            )
+            Urow = tl.sum(tl.where(is_ir[:, None] & (cols >= i)[None, :], tile, 0.0), axis=0)
             contrib = tl.where((rows > i)[:, None], Urow[:, None] * Uinv, 0.0)
             acc = tl.sum(contrib, axis=0)
             Uii = tl.sum(tl.where(is_ir[:, None] & (cols == i)[None, :], tile, 0.0))
@@ -260,11 +272,23 @@ def modlu_inv_block(blocks: torch.Tensor):
     Uinv = torch.empty_like(LU)
     grid = (b,)
     _modlu_inv_block_kernel[grid](
-        LU, s, Linv, Uinv, b, w,
-        LU.stride(0), LU.stride(1), LU.stride(2),
-        s.stride(0), s.stride(1),
-        Linv.stride(0), Linv.stride(1), Linv.stride(2),
-        Uinv.stride(0), Uinv.stride(1), Uinv.stride(2),
+        LU,
+        s,
+        Linv,
+        Uinv,
+        b,
+        w,
+        LU.stride(0),
+        LU.stride(1),
+        LU.stride(2),
+        s.stride(0),
+        s.stride(1),
+        Linv.stride(0),
+        Linv.stride(1),
+        Linv.stride(2),
+        Uinv.stride(0),
+        Uinv.stride(1),
+        Uinv.stride(2),
         BLOCK=BLOCK,
     )
     return LU, s, Linv, Uinv
@@ -288,14 +312,20 @@ def modlu_inv_block(blocks: torch.Tensor):
 
 @triton.jit
 def _chol_inv_block_kernel(
-    A_ptr,        # (B, w, w) SPD diagonal blocks (input)
-    L_ptr,        # (B, w, w) Cholesky factor L (lower), output
-    Li_ptr,       # (B, w, w) inverse L^{-1} (lower), output
-    b,            # batch size
-    w,            # actual block width (<= BLOCK)
-    stride_ab, stride_ai, stride_aj,
-    stride_lb, stride_li, stride_lj,
-    stride_ib, stride_ii, stride_ij,
+    A_ptr,  # (B, w, w) SPD diagonal blocks (input)
+    L_ptr,  # (B, w, w) Cholesky factor L (lower), output
+    Li_ptr,  # (B, w, w) inverse L^{-1} (lower), output
+    b,  # batch size
+    w,  # actual block width (<= BLOCK)
+    stride_ab,
+    stride_ai,
+    stride_aj,
+    stride_lb,
+    stride_li,
+    stride_lj,
+    stride_ib,
+    stride_ii,
+    stride_ij,
     BLOCK: tl.constexpr,
 ):
     """Cholesky ``G = L L^T`` (lower) + inverse ``L^{-1}`` of one block per program.
@@ -328,9 +358,7 @@ def _chol_inv_block_kernel(
             tile = tl.where(is_jr[:, None] & is_jc[None, :], r, tile)
             col_div = is_jc[None, :] & (rows > j)[:, None]
             tile = tl.where(col_div, tile / r, tile)
-            colj = tl.sum(
-                tl.where(is_jc[None, :] & (rows > j)[:, None], tile, 0.0), axis=1
-            )
+            colj = tl.sum(tl.where(is_jc[None, :] & (rows > j)[:, None], tile, 0.0), axis=1)
             upd = (rows > j)[:, None] & (cols > j)[None, :]
             tile = tl.where(upd, tile - colj[:, None] * colj[None, :], tile)
 
@@ -372,10 +400,20 @@ def chol_inv_block(blocks: torch.Tensor):
     Li = torch.empty_like(blk)
     grid = (b,)
     _chol_inv_block_kernel[grid](
-        blk, L, Li, b, w,
-        blk.stride(0), blk.stride(1), blk.stride(2),
-        L.stride(0), L.stride(1), L.stride(2),
-        Li.stride(0), Li.stride(1), Li.stride(2),
+        blk,
+        L,
+        Li,
+        b,
+        w,
+        blk.stride(0),
+        blk.stride(1),
+        blk.stride(2),
+        L.stride(0),
+        L.stride(1),
+        L.stride(2),
+        Li.stride(0),
+        Li.stride(1),
+        Li.stride(2),
         BLOCK=BLOCK,
     )
     return L, Li
@@ -396,12 +434,16 @@ def chol_inv_block(blocks: torch.Tensor):
 
 @triton.jit
 def _triu_inv_block_kernel(
-    A_ptr,        # (B, w, w) upper-triangular blocks (input)
-    Ai_ptr,       # (B, w, w) inverse (upper), output
-    b,            # batch size
-    w,            # actual block width (<= BLOCK)
-    stride_ab, stride_ai, stride_aj,
-    stride_ib, stride_ii, stride_ij,
+    A_ptr,  # (B, w, w) upper-triangular blocks (input)
+    Ai_ptr,  # (B, w, w) inverse (upper), output
+    b,  # batch size
+    w,  # actual block width (<= BLOCK)
+    stride_ab,
+    stride_ai,
+    stride_aj,
+    stride_ib,
+    stride_ii,
+    stride_ij,
     BLOCK: tl.constexpr,
 ):
     """Inverse ``U^{-1}`` (upper) of one ``w x w`` upper-triangular block/program.
@@ -456,9 +498,16 @@ def triu_inv_block(blocks: torch.Tensor):
     Ui = torch.empty_like(blk)
     grid = (b,)
     _triu_inv_block_kernel[grid](
-        blk, Ui, b, w,
-        blk.stride(0), blk.stride(1), blk.stride(2),
-        Ui.stride(0), Ui.stride(1), Ui.stride(2),
+        blk,
+        Ui,
+        b,
+        w,
+        blk.stride(0),
+        blk.stride(1),
+        blk.stride(2),
+        Ui.stride(0),
+        Ui.stride(1),
+        Ui.stride(2),
         BLOCK=BLOCK,
     )
     return Ui
@@ -486,15 +535,22 @@ def triu_inv_block(blocks: torch.Tensor):
 
 @triton.jit
 def _assemble_recon_kernel(
-    QtA_ptr,      # (B, n, n) Q^T A (GEMM output)
-    B_ptr,        # (B, n, n) modified-LU packed factor (strict lower = L)
-    s_ptr,        # (B, n) per-column diagonal sign
-    H_ptr,        # (B, n, n) output compact H
+    QtA_ptr,  # (B, n, n) Q^T A (GEMM output)
+    B_ptr,  # (B, n, n) modified-LU packed factor (strict lower = L)
+    s_ptr,  # (B, n) per-column diagonal sign
+    H_ptr,  # (B, n, n) output compact H
     n,
-    stride_qb, stride_qi, stride_qj,
-    stride_bb, stride_bi, stride_bj,
-    stride_sb, stride_si,
-    stride_hb, stride_hi, stride_hj,
+    stride_qb,
+    stride_qi,
+    stride_qj,
+    stride_bb,
+    stride_bi,
+    stride_bj,
+    stride_sb,
+    stride_si,
+    stride_hb,
+    stride_hi,
+    stride_hj,
     BLOCK_N: tl.constexpr,
 ):
     """Assemble one row of ``H``: upper-incl-diag = s[i]*QtA, strict lower = B."""
@@ -506,16 +562,19 @@ def _assemble_recon_kernel(
     sval = tl.load(s_ptr + bidx * stride_sb + i * stride_si)
     q = tl.load(
         QtA_ptr + bidx * stride_qb + i * stride_qi + cols * stride_qj,
-        mask=cmask, other=0.0,
+        mask=cmask,
+        other=0.0,
     )
     bl = tl.load(
         B_ptr + bidx * stride_bb + i * stride_bi + cols * stride_bj,
-        mask=cmask, other=0.0,
+        mask=cmask,
+        other=0.0,
     )
     h = tl.where(cols >= i, sval * q, bl)
     tl.store(
         H_ptr + bidx * stride_hb + i * stride_hi + cols * stride_hj,
-        h, mask=cmask,
+        h,
+        mask=cmask,
     )
 
 
@@ -533,11 +592,22 @@ def assemble_recon(QtA: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> torch
     BLOCK_N = triton.next_power_of_2(n)
     grid = (b * n,)
     _assemble_recon_kernel[grid](
-        QtA, B, s, H, n,
-        QtA.stride(0), QtA.stride(1), QtA.stride(2),
-        B.stride(0), B.stride(1), B.stride(2),
-        s.stride(0), s.stride(1),
-        H.stride(0), H.stride(1), H.stride(2),
+        QtA,
+        B,
+        s,
+        H,
+        n,
+        QtA.stride(0),
+        QtA.stride(1),
+        QtA.stride(2),
+        B.stride(0),
+        B.stride(1),
+        B.stride(2),
+        s.stride(0),
+        s.stride(1),
+        H.stride(0),
+        H.stride(1),
+        H.stride(2),
         BLOCK_N=BLOCK_N,
     )
     return H

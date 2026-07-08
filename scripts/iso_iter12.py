@@ -7,6 +7,7 @@ already gate-validated) on orthonormal Q from real benchmark inputs, checking:
  - packed LU matches
  - reconstructed compact (H,tau) -> Q_recon matches
 """
+
 from __future__ import annotations
 
 import sys
@@ -16,11 +17,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import torch  # noqa: E402
+
 from qrbench import inputs  # noqa: E402
-from qrbench.variants import (  # noqa: E402
-    _choleskyqr, _modified_lu_fused, _modified_lu_fused_inv,
-)
 from qrbench.triton_kernels import modlu_block, modlu_inv_block  # noqa: E402
+from qrbench.variants import (  # noqa: E402
+    _choleskyqr,
+    _modified_lu_fused,
+    _modified_lu_fused_inv,
+)
 
 
 def test_block_kernel():
@@ -41,8 +45,10 @@ def test_block_kernel():
             U = torch.triu(LU1)
             il = (L @ Linv - torch.eye(w, device="cuda")).abs().amax(dim=(-2, -1)).max().item()
             iu = (U @ Uinv - torch.eye(w, device="cuda")).abs().amax(dim=(-2, -1)).max().item()
-            print(f"  w={w:2d} b={b:4d}  d_s={ds:.2e} d_LU={dlu:.2e} "
-                  f"||L Linv - I||={il:.2e} ||U Uinv - I||={iu:.2e}")
+            print(
+                f"  w={w:2d} b={b:4d}  d_s={ds:.2e} d_LU={dlu:.2e} "
+                f"||L Linv - I||={il:.2e} ||U Uinv - I||={iu:.2e}"
+            )
 
 
 def recon_to_Q(Q):
@@ -53,13 +59,19 @@ def recon_to_Q(Q):
 
 def test_pipeline(batch, n, cond):
     print(f"\n== pipeline recon compare b{batch} n{n} cond{cond} ==")
-    prob = inputs.make_benchmark_problem(
-        {"batch": batch, "n": n, "cond": cond}, device="cuda")
+    prob = inputs.make_benchmark_problem({"batch": batch, "n": n, "cond": cond}, device="cuda")
     A = prob.tensor
     Q, _ = _choleskyqr(
-        A, passes=2, use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
-        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
-        shift=True, shift_coef=1.5,
+        A,
+        passes=2,
+        use_triton_chol=True,
+        chol_kblock=64,
+        chol_fused_max_n=768,
+        use_triton_trsm=True,
+        trsm_kblock=64,
+        trsm_fused_max_n=768,
+        shift=True,
+        shift_coef=1.5,
     )
     # only compare converged (finite, orthonormal) elements
     eye = torch.eye(n, device="cuda")

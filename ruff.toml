@@ -1,0 +1,16 @@
+# Non-aggressive ruleset: pyflakes (F), pycodestyle basics (E/W), isort (I).
+# Kept deliberately small so enabling linting does not force behavior changes.
+line-length = 100
+target-version = "py310"
+
+[lint]
+select = ["F", "E", "W", "I"]
+# E501 (line-too-long) is reported by the formatter's own wrapping; leave lint
+# noise low. E741 (ambiguous names) is common in numeric code (l, I, O).
+ignore = ["E501", "E741"]
+
+[lint.isort]
+known-first-party = ["qrbench"]
+
+[format]
+quote-style = "double"

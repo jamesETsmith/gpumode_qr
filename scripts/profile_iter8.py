@@ -24,8 +24,8 @@ import torch  # noqa: E402
 from qrbench import inputs  # noqa: E402
 from qrbench.variants import (  # noqa: E402
     _batched_cholesky,
-    _trsm,
     _modified_lu,
+    _trsm,
 )
 
 

@@ -90,15 +90,15 @@ def make_blocked_householder(block: int = 64) -> QRImpl:
         while k < n:
             j = min(block, n - k)
             # factor panel: rows [k:], cols [k:k+j]
-            panel = H[:, k:, k:k + j].contiguous()
+            panel = H[:, k:, k : k + j].contiguous()
             pH, ptau = torch.geqrf(panel)
-            H[:, k:, k:k + j] = pH
-            tau[:, k:k + j] = ptau
+            H[:, k:, k : k + j] = pH
+            tau[:, k : k + j] = ptau
 
             # update trailing block with Q_panel^T
             if k + j < n:
-                trailing = H[:, k:, k + j:].contiguous()
-                H[:, k:, k + j:] = torch.ormqr(pH, ptau, trailing, left=True, transpose=True)
+                trailing = H[:, k:, k + j :].contiguous()
+                H[:, k:, k + j :] = torch.ormqr(pH, ptau, trailing, left=True, transpose=True)
 
             k += j
 
@@ -137,10 +137,10 @@ def make_blocked_wy(block: int = 64, small_n: int = 256, min_batch: int = 16) ->
         k = 0
         while k < n:
             j = min(block, n - k)
-            panel = H[:, k:, k:k + j].contiguous()
+            panel = H[:, k:, k : k + j].contiguous()
             pH, ptau = torch.geqrf(panel)
-            H[:, k:, k:k + j] = pH
-            tau[:, k:k + j] = ptau
+            H[:, k:, k : k + j] = pH
+            tau[:, k : k + j] = ptau
 
             if k + j < n:
                 # V: unit lower-trapezoidal reflectors (m x j), diag = 1
@@ -153,13 +153,13 @@ def make_blocked_wy(block: int = 64, small_n: int = 256, min_batch: int = 16) ->
                 T = torch.zeros(batch, j, j, device=A.device, dtype=A.dtype)
                 T[:, 0, 0] = ptau[:, 0]
                 for i in range(1, j):
-                    Ti = -ptau[:, i:i + 1].unsqueeze(-1) * (T[:, :i, :i] @ W[:, :i, i:i + 1])
-                    T[:, :i, i:i + 1] = Ti
+                    Ti = -ptau[:, i : i + 1].unsqueeze(-1) * (T[:, :i, :i] @ W[:, :i, i : i + 1])
+                    T[:, :i, i : i + 1] = Ti
                     T[:, i, i] = ptau[:, i]
 
-                C = H[:, k:, k + j:].contiguous()
+                C = H[:, k:, k + j :].contiguous()
                 C = C - V @ (T.transpose(-2, -1) @ (V.transpose(-2, -1) @ C))
-                H[:, k:, k + j:] = C
+                H[:, k:, k + j :] = C
 
             k += j
 
@@ -190,8 +190,11 @@ def _trsm(
         )
     outs = [
         torch.linalg.solve_triangular(
-            Atri[i:i + max_batch], B[i:i + max_batch],
-            upper=upper, left=left, unitriangular=unitriangular,
+            Atri[i : i + max_batch],
+            B[i : i + max_batch],
+            upper=upper,
+            left=left,
+            unitriangular=unitriangular,
         )
         for i in range(0, bs, max_batch)
     ]
@@ -212,17 +215,15 @@ def _batched_cholesky(G: torch.Tensor, block: int = 256) -> torch.Tensor:
     L = G.clone()
     for k in range(0, n, block):
         kb = min(block, n - k)
-        A11 = L[:, k:k + kb, k:k + kb].contiguous()
+        A11 = L[:, k : k + kb, k : k + kb].contiguous()
         L11 = torch.linalg.cholesky_ex(A11)[0]
-        L[:, k:k + kb, k:k + kb] = L11
+        L[:, k : k + kb, k : k + kb] = L11
         if k + kb < n:
-            A21 = L[:, k + kb:, k:k + kb].contiguous()
+            A21 = L[:, k + kb :, k : k + kb].contiguous()
             # L21 = A21 @ L11^{-T}  (solve X L11^T = A21)
-            L21 = _trsm(
-                L11.transpose(-2, -1), A21, upper=True, left=False
-            )
-            L[:, k + kb:, k:k + kb] = L21
-            L[:, k + kb:, k + kb:] = L[:, k + kb:, k + kb:] - L21 @ L21.transpose(-2, -1)
+            L21 = _trsm(L11.transpose(-2, -1), A21, upper=True, left=False)
+            L[:, k + kb :, k : k + kb] = L21
+            L[:, k + kb :, k + kb :] = L[:, k + kb :, k + kb :] - L21 @ L21.transpose(-2, -1)
     return torch.tril(L)
 
 
@@ -242,15 +243,15 @@ def _batched_cholesky_fused(G: torch.Tensor, block: int = 32) -> torch.Tensor:
     M = G.clone()
     for k in range(0, n, block):
         w = min(block, n - k)
-        blk = M[:, k:k + w, k:k + w].contiguous()
+        blk = M[:, k : k + w, k : k + w].contiguous()
         L11, L11inv = chol_inv_block(blk)
-        M[:, k:k + w, k:k + w] = L11
+        M[:, k : k + w, k : k + w] = L11
         if k + w < n:
-            A21 = M[:, k + w:, k:k + w].contiguous()
+            A21 = M[:, k + w :, k : k + w].contiguous()
             # L21 = A21 @ L11^{-T} = A21 @ (L11inv)^T
             L21 = A21 @ L11inv.transpose(-2, -1)
-            M[:, k + w:, k:k + w] = L21
-            M[:, k + w:, k + w:] = M[:, k + w:, k + w:] - L21 @ L21.transpose(-2, -1)
+            M[:, k + w :, k : k + w] = L21
+            M[:, k + w :, k + w :] = M[:, k + w :, k + w :] - L21 @ L21.transpose(-2, -1)
     return torch.tril(M)
 
 
@@ -272,12 +273,12 @@ def _trsm_right_upper_fused(R: torch.Tensor, A: torch.Tensor, block: int = 64):
     X = torch.empty_like(A)
     for j in range(0, n, block):
         jw = min(block, n - j)
-        Rjj = R[:, j:j + jw, j:j + jw].contiguous()
+        Rjj = R[:, j : j + jw, j : j + jw].contiguous()
         Rinv = triu_inv_block(Rjj)
-        corr = A[:, :, j:j + jw]
+        corr = A[:, :, j : j + jw]
         if j > 0:
-            corr = corr - X[:, :, :j] @ R[:, :j, j:j + jw]
-        X[:, :, j:j + jw] = corr @ Rinv
+            corr = corr - X[:, :, :j] @ R[:, :j, j : j + jw]
+        X[:, :, j : j + jw] = corr @ Rinv
     return X
 
 
@@ -384,22 +385,20 @@ def _modified_lu(Q: torch.Tensor, block: int = 64):
             B[:, j, j] = d - sj
             piv = B[:, j, j]
             if j + 1 < n:
-                B[:, j + 1:, j] = B[:, j + 1:, j] / piv.unsqueeze(-1)
+                B[:, j + 1 :, j] = B[:, j + 1 :, j] / piv.unsqueeze(-1)
             if j + 1 < k + w:
-                B[:, j + 1:, j + 1:k + w] = (
-                    B[:, j + 1:, j + 1:k + w]
-                    - B[:, j + 1:, j:j + 1] * B[:, j:j + 1, j + 1:k + w]
+                B[:, j + 1 :, j + 1 : k + w] = (
+                    B[:, j + 1 :, j + 1 : k + w]
+                    - B[:, j + 1 :, j : j + 1] * B[:, j : j + 1, j + 1 : k + w]
                 )
         if k + w < n:
-            L11 = B[:, k:k + w, k:k + w]
-            B12 = B[:, k:k + w, k + w:].contiguous()
+            L11 = B[:, k : k + w, k : k + w]
+            B12 = B[:, k : k + w, k + w :].contiguous()
             # U12 = L11^{-1} @ B12  (unit lower triangular solve)
-            U12 = _trsm(
-                L11, B12, upper=False, left=True, unitriangular=True
-            )
-            B[:, k:k + w, k + w:] = U12
-            L21 = B[:, k + w:, k:k + w]
-            B[:, k + w:, k + w:] = B[:, k + w:, k + w:] - L21 @ U12
+            U12 = _trsm(L11, B12, upper=False, left=True, unitriangular=True)
+            B[:, k : k + w, k + w :] = U12
+            L21 = B[:, k + w :, k : k + w]
+            B[:, k + w :, k + w :] = B[:, k + w :, k + w :] - L21 @ U12
     return B, s
 
 
@@ -425,22 +424,22 @@ def _modified_lu_fused(Q: torch.Tensor, block: int = 32):
 
     for k in range(0, n, block):
         w = min(block, n - k)
-        blk = B[:, k:k + w, k:k + w].contiguous()
+        blk = B[:, k : k + w, k : k + w].contiguous()
         LU, s_blk = modlu_block(blk)
-        B[:, k:k + w, k:k + w] = LU
-        s[:, k:k + w] = s_blk
+        B[:, k : k + w, k : k + w] = LU
+        s[:, k : k + w] = s_blk
         if k + w < n:
-            L11 = B[:, k:k + w, k:k + w]
+            L11 = B[:, k : k + w, k : k + w]
             U11 = torch.triu(L11)
             # L21 = A21 @ U11^{-1}  (solve X U11 = A21, U11 upper)
-            A21 = B[:, k + w:, k:k + w].contiguous()
+            A21 = B[:, k + w :, k : k + w].contiguous()
             L21 = _trsm(U11, A21, upper=True, left=False)
-            B[:, k + w:, k:k + w] = L21
+            B[:, k + w :, k : k + w] = L21
             # U12 = L11^{-1} @ B12  (unit-lower left solve)
-            B12 = B[:, k:k + w, k + w:].contiguous()
+            B12 = B[:, k : k + w, k + w :].contiguous()
             U12 = _trsm(L11, B12, upper=False, left=True, unitriangular=True)
-            B[:, k:k + w, k + w:] = U12
-            B[:, k + w:, k + w:] = B[:, k + w:, k + w:] - L21 @ U12
+            B[:, k : k + w, k + w :] = U12
+            B[:, k + w :, k + w :] = B[:, k + w :, k + w :] - L21 @ U12
     return B, s
 
 
@@ -467,20 +466,20 @@ def _modified_lu_fused_inv(Q: torch.Tensor, block: int = 32):
 
     for k in range(0, n, block):
         w = min(block, n - k)
-        blk = B[:, k:k + w, k:k + w].contiguous()
+        blk = B[:, k : k + w, k : k + w].contiguous()
         LU, s_blk, L11inv, U11inv = modlu_inv_block(blk)
-        B[:, k:k + w, k:k + w] = LU
-        s[:, k:k + w] = s_blk
+        B[:, k : k + w, k : k + w] = LU
+        s[:, k : k + w] = s_blk
         if k + w < n:
             # L21 = A21 @ U11^{-1}
-            A21 = B[:, k + w:, k:k + w].contiguous()
+            A21 = B[:, k + w :, k : k + w].contiguous()
             L21 = A21 @ U11inv
-            B[:, k + w:, k:k + w] = L21
+            B[:, k + w :, k : k + w] = L21
             # U12 = L11^{-1} @ B12
-            B12 = B[:, k:k + w, k + w:].contiguous()
+            B12 = B[:, k : k + w, k + w :].contiguous()
             U12 = L11inv @ B12
-            B[:, k:k + w, k + w:] = U12
-            B[:, k + w:, k + w:] = B[:, k + w:, k + w:] - L21 @ U12
+            B[:, k : k + w, k + w :] = U12
+            B[:, k + w :, k + w :] = B[:, k + w :, k + w :] - L21 @ U12
     return B, s
 
 
@@ -534,6 +533,7 @@ def make_cholqr_recon(
         QtA = Q.transpose(-2, -1) @ A_
         if fused_assembly:
             from .triton_kernels import assemble_recon
+
             H = assemble_recon(QtA, B, s)
         else:
             R_stored = torch.triu(s.unsqueeze(-1) * QtA)
@@ -546,12 +546,17 @@ def make_cholqr_recon(
             return torch.geqrf(A)
         try:
             Q, _R = _choleskyqr(
-                A, passes=passes, chol_block=chol_block,
-                use_triton_chol=use_triton_chol, chol_kblock=chol_kblock,
+                A,
+                passes=passes,
+                chol_block=chol_block,
+                use_triton_chol=use_triton_chol,
+                chol_kblock=chol_kblock,
                 chol_fused_max_n=chol_fused_max_n,
-                use_triton_trsm=use_triton_trsm, trsm_kblock=trsm_kblock,
+                use_triton_trsm=use_triton_trsm,
+                trsm_kblock=trsm_kblock,
                 trsm_fused_max_n=trsm_fused_max_n,
-                shift=shift, shift_coef=shift_coef,
+                shift=shift,
+                shift_coef=shift_coef,
             )
 
             # Per-element guard: CholeskyQR can fail to produce an orthonormal Q
@@ -590,14 +595,19 @@ def make_cholqr_recon(
                     # the launch-bound fused kernels at that batch size.
                     Asub = A[idx]
                     Qsub, _ = _choleskyqr(
-                        Asub, passes=repair_passes, chol_block=chol_block,
-                        use_triton_chol=False, use_triton_trsm=False,
-                        shift=True, shift_coef=repair_shift_coef,
+                        Asub,
+                        passes=repair_passes,
+                        chol_block=chol_block,
+                        use_triton_chol=False,
+                        use_triton_trsm=False,
+                        shift=True,
+                        shift_coef=repair_shift_coef,
                     )
                     oe_sub = (Qsub.transpose(-2, -1) @ Qsub - eye).abs().amax(dim=(-2, -1))
                     Hsub, tausub = _reconstruct(Qsub, Asub)
                     sub_bad = (
-                        ~torch.isfinite(oe_sub) | (oe_sub > 1e-4)
+                        ~torch.isfinite(oe_sub)
+                        | (oe_sub > 1e-4)
                         | ~torch.isfinite(Hsub).all(dim=(-2, -1))
                         | ~torch.isfinite(tausub).all(dim=-1)
                     )
@@ -640,9 +650,7 @@ VARIANTS: dict[str, QRImpl] = {
     # the per-column Python launch overhead that dominates the reconstruction at
     # large n / small batch, while keeping the efficient batched trsm/GEMM
     # trailing updates. See LOG.md iteration 8.
-    "cholqr2_recon_fused": make_cholqr_recon(
-        passes=2, lu_block=32, use_triton_modlu=True
-    ),
+    "cholqr2_recon_fused": make_cholqr_recon(passes=2, lu_block=32, use_triton_modlu=True),
     # Iteration 9: identical to ``cholqr2_recon_fused`` (2 passes, fused Triton
     # modified-LU reconstruction) but the CholeskyQR term's batched Cholesky is
     # also replaced by a custom right-looking blocked Cholesky whose diagonal
@@ -651,8 +659,12 @@ VARIANTS: dict[str, QRImpl] = {
     # GEMM. Attacks the rocSOLVER/rocBLAS batch serialization that dominates the
     # priority b640 n512 shape. See LOG.md iteration 9.
     "cholqr2_recon_fused2": make_cholqr_recon(
-        passes=2, lu_block=32, use_triton_modlu=True,
-        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
+        passes=2,
+        lu_block=32,
+        use_triton_modlu=True,
+        use_triton_chol=True,
+        chol_kblock=64,
+        chol_fused_max_n=768,
     ),
     # Iteration 10: identical to ``cholqr2_recon_fused2`` but the Q-forming
     # triangular solve ``X R = A`` (X = A R^{-1}, R upper) across the two
@@ -663,9 +675,15 @@ VARIANTS: dict[str, QRImpl] = {
     # batched-trsm serialization that dominates b640 n512 after iteration 9.
     # See LOG.md iteration 10.
     "cholqr2_recon_fused3": make_cholqr_recon(
-        passes=2, lu_block=32, use_triton_modlu=True,
-        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
-        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
+        passes=2,
+        lu_block=32,
+        use_triton_modlu=True,
+        use_triton_chol=True,
+        chol_kblock=64,
+        chol_fused_max_n=768,
+        use_triton_trsm=True,
+        trsm_kblock=64,
+        trsm_fused_max_n=768,
     ),
     # Iteration 11: identical fused pipeline as ``cholqr2_recon_fused3`` but the
     # CholeskyQR2 is upgraded to *shifted CholeskyQR3*: a single Cholesky pass on
@@ -680,10 +698,17 @@ VARIANTS: dict[str, QRImpl] = {
     # for genuinely rank-deficient stress inputs (cheap, small batch). See
     # LOG.md iteration 11.
     "cholqr3_shift_recon": make_cholqr_recon(
-        passes=2, lu_block=32, use_triton_modlu=True,
-        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
-        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
-        shift=True, shift_coef=1.5,
+        passes=2,
+        lu_block=32,
+        use_triton_modlu=True,
+        use_triton_chol=True,
+        chol_kblock=64,
+        chol_fused_max_n=768,
+        use_triton_trsm=True,
+        trsm_kblock=64,
+        trsm_fused_max_n=768,
+        shift=True,
+        shift_coef=1.5,
     ),
     # Iteration 12: identical to ``cholqr3_shift_recon`` but the modified-LU
     # Householder reconstruction replaces its two per-block library ``_trsm``
@@ -693,10 +718,17 @@ VARIANTS: dict[str, QRImpl] = {
     # Mathematically identical output; attacks the largest remaining compute
     # component of the priority shape. See LOG.md iteration 12.
     "cholqr3_shift_recon_invlu": make_cholqr_recon(
-        passes=2, lu_block=32, use_triton_modlu_inv=True,
-        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=768,
-        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
-        shift=True, shift_coef=1.5,
+        passes=2,
+        lu_block=32,
+        use_triton_modlu_inv=True,
+        use_triton_chol=True,
+        chol_kblock=64,
+        chol_fused_max_n=768,
+        use_triton_trsm=True,
+        trsm_kblock=64,
+        trsm_fused_max_n=768,
+        shift=True,
+        shift_coef=1.5,
     ),
     # Iteration 13: identical to ``cholqr3_shift_recon_invlu`` but the fused
     # blocked Cholesky gate is raised from n<=768 to n<=1024 so the n1024
@@ -713,10 +745,17 @@ VARIANTS: dict[str, QRImpl] = {
     # 30.0 vs 30.8 ms measured difference). n<=256 / batch<16 (n2048/n4096)
     # still dispatch to geqrf, so only n1024 changes. See LOG.md iteration 13.
     "cholqr3_shift_recon_bign": make_cholqr_recon(
-        passes=2, lu_block=32, use_triton_modlu_inv=True,
-        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=1024,
-        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
-        shift=True, shift_coef=1.5,
+        passes=2,
+        lu_block=32,
+        use_triton_modlu_inv=True,
+        use_triton_chol=True,
+        chol_kblock=64,
+        chol_fused_max_n=1024,
+        use_triton_trsm=True,
+        trsm_kblock=64,
+        trsm_fused_max_n=768,
+        shift=True,
+        shift_coef=1.5,
     ),
     # Iteration 14: identical to ``cholqr3_shift_recon_bign`` but the residual
     # non-converged (near-rank-deficient) elements are repaired by a *batched*
@@ -732,11 +771,20 @@ VARIANTS: dict[str, QRImpl] = {
     # last resort for genuinely rank-deficient stress inputs (which do not
     # converge under any finite shift). See LOG.md iteration 14.
     "cholqr3_shift_recon_batchfix": make_cholqr_recon(
-        passes=2, lu_block=32, use_triton_modlu_inv=True,
-        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=1024,
-        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
-        shift=True, shift_coef=1.5,
-        batch_repair=True, repair_passes=3, repair_shift_coef=3.0,
+        passes=2,
+        lu_block=32,
+        use_triton_modlu_inv=True,
+        use_triton_chol=True,
+        chol_kblock=64,
+        chol_fused_max_n=1024,
+        use_triton_trsm=True,
+        trsm_kblock=64,
+        trsm_fused_max_n=768,
+        shift=True,
+        shift_coef=1.5,
+        batch_repair=True,
+        repair_passes=3,
+        repair_shift_coef=3.0,
     ),
     # Iteration 16: identical pipeline to ``cholqr3_shift_recon_batchfix`` (the
     # active best) but the modified-LU Householder reconstruction's R-assembly
@@ -749,11 +797,20 @@ VARIANTS: dict[str, QRImpl] = {
     # (it is load-bearing for the tight factor gate). Bit-for-bit identical
     # output to ``_batchfix``. See LOG.md iteration 16.
     "cholqr3_shift_recon_fusedasm": make_cholqr_recon(
-        passes=2, lu_block=32, use_triton_modlu_inv=True,
-        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=1024,
-        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
-        shift=True, shift_coef=1.5,
-        batch_repair=True, repair_passes=3, repair_shift_coef=3.0,
+        passes=2,
+        lu_block=32,
+        use_triton_modlu_inv=True,
+        use_triton_chol=True,
+        chol_kblock=64,
+        chol_fused_max_n=1024,
+        use_triton_trsm=True,
+        trsm_kblock=64,
+        trsm_fused_max_n=768,
+        shift=True,
+        shift_coef=1.5,
+        batch_repair=True,
+        repair_passes=3,
+        repair_shift_coef=3.0,
         fused_assembly=True,
     ),
     # Iteration 17: identical pipeline to ``cholqr3_shift_recon_fusedasm`` (the
@@ -775,11 +832,20 @@ VARIANTS: dict[str, QRImpl] = {
     # geqrf guard exactly as before. Everything except ``repair_passes`` is
     # byte-for-byte ``_fusedasm``. See LOG.md iteration 17.
     "cholqr3_shift_recon_repair2": make_cholqr_recon(
-        passes=2, lu_block=32, use_triton_modlu_inv=True,
-        use_triton_chol=True, chol_kblock=64, chol_fused_max_n=1024,
-        use_triton_trsm=True, trsm_kblock=64, trsm_fused_max_n=768,
-        shift=True, shift_coef=1.5,
-        batch_repair=True, repair_passes=2, repair_shift_coef=3.0,
+        passes=2,
+        lu_block=32,
+        use_triton_modlu_inv=True,
+        use_triton_chol=True,
+        chol_kblock=64,
+        chol_fused_max_n=1024,
+        use_triton_trsm=True,
+        trsm_kblock=64,
+        trsm_fused_max_n=768,
+        shift=True,
+        shift_coef=1.5,
+        batch_repair=True,
+        repair_passes=2,
+        repair_shift_coef=3.0,
         fused_assembly=True,
     ),
     "blocked_wy_b32": make_blocked_wy(32),
