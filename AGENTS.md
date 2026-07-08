@@ -13,6 +13,7 @@ The good folks at GPUMODE have set up a new challenge to improve the gpu kernels
 - Absolutely no network, node, or firmware info should ever be checked in.
 - Before committing any code, review these rules for compliance
 - Always run detached processes in case this session gets disconnected.
+- All markdown documentation should be in the `docs` directory.
 
 
 ## Official Instructions
