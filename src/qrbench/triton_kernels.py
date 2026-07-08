@@ -909,7 +909,7 @@ def _hh_panel_kernel(
     )
 
 
-def hh_panel_qr(panel: torch.Tensor):
+def hh_panel_qr(panel: torch.Tensor, num_warps: int | None = None, num_stages: int = 1):
     """Fused Householder factorization of a batch of ``r x w`` panels + WY ``T``.
 
     ``panel``: (B, r, w) contiguous float32 (r = remaining rows, w = panel
@@ -919,6 +919,11 @@ def hh_panel_qr(panel: torch.Tensor):
     matrix, ``tau`` (B, w) are the reflector coefficients, and ``T`` (B, w, w) is
     the compact-WY (upper) block-reflector factor such that applying the panel's
     ``Qᵀ`` to a trailing block ``C`` is ``C -= V @ (Tᵀ @ (Vᵀ @ C))``.
+
+    ``num_warps`` overrides the launch warp count (``None`` uses the historical
+    ``4 if BLOCK_R <= 128 else 8`` heuristic); ``num_stages`` sets the Triton
+    software-pipelining depth. These are pure launch-config knobs and do not
+    change the numerics (iteration 21 autotune).
     """
     b, r, w = panel.shape
     BLOCK_R = triton.next_power_of_2(r)
@@ -928,7 +933,8 @@ def hh_panel_qr(panel: torch.Tensor):
     V = torch.empty_like(p)
     tau = torch.empty(b, w, device=panel.device, dtype=panel.dtype)
     T = torch.empty(b, w, w, device=panel.device, dtype=panel.dtype)
-    num_warps = 4 if BLOCK_R <= 128 else 8
+    if num_warps is None:
+        num_warps = 4 if BLOCK_R <= 128 else 8
     grid = (b,)
     _hh_panel_kernel[grid](
         p,
@@ -954,6 +960,7 @@ def hh_panel_qr(panel: torch.Tensor):
         T.stride(1),
         T.stride(2),
         num_warps=num_warps,
+        num_stages=num_stages,
         BLOCK_R=BLOCK_R,
         BLOCK_W=BLOCK_W,
     )
