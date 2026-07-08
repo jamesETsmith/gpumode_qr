@@ -1,0 +1,50 @@
+# Pre-commit hooks for gpumode_qr.
+# Install:  uv tool install pre-commit  (or: pipx install pre-commit)
+#           pre-commit install
+# Run all:  pre-commit run --all-files
+#
+# AGENTS.md rule enforced by the local `no-node-info` hook:
+#   "Absolutely no network, node, or firmware info should ever be checked in."
+exclude: '^(plots/|logs/)'
+
+repos:
+  # --- Secret scanning (primary) ---
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks
+
+  # --- Standard hygiene ---
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: detect-private-key
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  # --- Python lint + format ---
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.0
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format
+
+  # --- Local: enforce AGENTS.md "no network/node/firmware info" rule ---
+  - repo: local
+    hooks:
+      - id: no-node-info
+        name: no network/node/firmware info
+        entry: python3 scripts/check_no_node_info.py
+        language: system
+        pass_filenames: true
+        exclude: '^scripts/check_no_node_info\.py$'

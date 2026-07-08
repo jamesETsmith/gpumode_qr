@@ -157,6 +157,42 @@ truth for where time is actually spent.
 - Any code that gets benchmarked must be committed.
 - Run only one benchmark at a time.
 
+## Developer tooling (pre-commit)
+
+Commit hooks enforce secret scanning, basic hygiene, Python lint/format, and the
+AGENTS.md rule that **no network / node / firmware info** is ever checked in.
+
+Install the tool once (the host has `uv`), then wire it into the repo:
+
+```bash
+uv tool install pre-commit      # or: pipx install pre-commit
+pre-commit install              # installs the git pre-commit hook
+```
+
+Run against everything (useful after cloning or editing the config):
+
+```bash
+pre-commit run --all-files
+```
+
+Hooks configured in [`.pre-commit-config.yaml`](.pre-commit-config.yaml):
+
+- **gitleaks** — secret scanning.
+- **pre-commit-hooks** — `trailing-whitespace`, `end-of-file-fixer`,
+  `check-added-large-files` (max 1024 KB), `check-merge-conflict`,
+  `check-yaml`/`check-json`/`check-toml`, `detect-private-key`,
+  `check-case-conflict`, `mixed-line-ending`.
+- **ruff** + **ruff-format** — lint (pyflakes `F`, pycodestyle `E`/`W`, isort
+  `I`; see [`ruff.toml`](ruff.toml)) with autofix, plus formatting.
+- **no-node-info** (local, stdlib-only
+  [`scripts/check_no_node_info.py`](scripts/check_no_node_info.py)) — blocks
+  commits containing IPv4/IPv6, MAC addresses, GPU UUIDs, PCI bus IDs, or
+  serial/vbios/bmc/ipmi/firmware/hostname tokens. Allowed GPU model strings
+  (MI350X / gfx950 / Instinct / ROCm) are explicitly not flagged.
+
+The `pre-commit` dev dependency is also listed in
+[`requirements-dev.txt`](requirements-dev.txt).
+
 ## Baseline snapshot (torch.geqrf, MI350X)
 
 `torch.geqrf` (rocSOLVER batched path) is correct on all shapes but slow for

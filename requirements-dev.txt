@@ -1,0 +1,4 @@
+# Developer tooling (not required to run benchmarks).
+# Preferred install is an isolated tool: `uv tool install pre-commit`
+# (or `pipx install pre-commit`), then `pre-commit install`.
+pre-commit>=4.6
