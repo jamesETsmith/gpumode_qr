@@ -611,3 +611,145 @@ def assemble_recon(QtA: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> torch
         BLOCK_N=BLOCK_N,
     )
     return H
+
+
+# ---------------------------------------------------------------------------
+# Iteration 18: fused single-block-per-matrix Householder QR for small n.
+#
+# The NVIDIA seed (``references/nvidia_winner_sol_combo.md``) factors a whole
+# small matrix (``n <= 192``) with ONE CUDA block per matrix entirely in shared
+# memory (``qr_fused_kernel`` -> ``panel_core``), producing geqrf-format
+# (H, tau) with no trailing GEMM. That kernel's warp-reduction / ``__shfl``
+# logic assumes 32-lane warps and requests up to 232 KB dynamic smem — neither
+# is available on gfx950 (64-lane wavefronts, ~64 KB LDS). Rather than port the
+# HIP kernel + fix the wavefront/LDS assumptions, we express the same
+# fully-fused algorithm in **Triton** (our proven gfx950 vehicle, wavefront-
+# agnostic): one Triton program per batch element holds the ``n x n`` matrix as
+# an in-register tile and runs the sequential Householder column loop with
+# whole-tile reductions (same one-program-per-batch-element pattern as the
+# modified-LU / Cholesky block kernels above).
+#
+# This validates the fused in-register Householder primitive (``house_coeffs``,
+# reflector application, geqrf (H, tau) packing) that the larger panel + GEMM
+# port (iteration 19) will reuse. Because the whole tile lives in registers the
+# practical cap is modest (``next_power_of_2(n)`` tile per program); it is used
+# only where it fits and is correct (small n), with the champion / geqrf path
+# handling everything else so no other shape can regress.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _hh_fused_qr_kernel(
+    A_ptr,  # (B, n, n) input matrices
+    H_ptr,  # (B, n, n) output compact H (R upper, reflectors below diagonal)
+    tau_ptr,  # (B, n) output reflector coefficients
+    b,  # batch size
+    n,  # matrix dimension (<= BLOCK)
+    stride_ab,
+    stride_ai,
+    stride_aj,
+    stride_hb,
+    stride_hi,
+    stride_hj,
+    stride_tb,
+    stride_tj,
+    BLOCK: tl.constexpr,
+):
+    """Unblocked Householder QR of one ``n x n`` matrix per program (geqrf form).
+
+    Standard LAPACK ``sgeqrf`` convention (matches ``slarfg`` + ``householder_
+    product``): for each column ``j`` build the reflector ``H_j = I - tau_j v_j
+    v_j^T`` from ``A[j:, j]`` (``beta = -sign(alpha)*||.||``, ``tau = (beta -
+    alpha)/beta``, ``v`` essential = ``A[j+1:, j] / (alpha - beta)``), apply it to
+    the trailing columns, store ``beta`` on the diagonal, the essential ``v``
+    strictly below it, and ``tau_j``. Degenerate columns (``sigma <= 0``) give
+    ``tau = 0`` (identity reflector), matching ``slarfg``.
+    """
+    pid = tl.program_id(0)
+    if pid >= b:
+        return
+
+    rows = tl.arange(0, BLOCK)
+    cols = tl.arange(0, BLOCK)
+    rmask = rows < n
+    cmask = cols < n
+    tile_mask = rmask[:, None] & cmask[None, :]
+
+    base = A_ptr + pid * stride_ab
+    ptrs = base + rows[:, None] * stride_ai + cols[None, :] * stride_aj
+    tile = tl.load(ptrs, mask=tile_mask, other=0.0)
+
+    tau_acc = tl.zeros((BLOCK,), dtype=tile.dtype)
+
+    for j in range(0, BLOCK):
+        if j < n:
+            is_j_col = cols == j
+            is_j_row = rows == j
+            below = rows > j
+            # column j as a vector over rows (current values; trailing updates in
+            # previous iterations never touched columns <= j).
+            colj = tl.sum(tl.where(is_j_col[None, :], tile, 0.0), axis=1)
+            alpha = tl.sum(tl.where(is_j_row, colj, 0.0))
+            sigma = tl.sum(tl.where(below, colj * colj, 0.0))
+
+            safe = sigma > 0.0
+            norm = tl.sqrt(alpha * alpha + sigma)
+            beta_full = -tl.where(alpha >= 0.0, norm, -norm)
+            tau_j = tl.where(safe, (beta_full - alpha) / beta_full, 0.0)
+            gamma = tl.where(safe, 1.0 / (alpha - beta_full), 0.0)
+            beta = tl.where(safe, beta_full, alpha)
+
+            # reflector vector v (rows): 1 on the diagonal, essential below, 0 above.
+            vrow = tl.where(is_j_row, 1.0, tl.where(below, colj * gamma, 0.0))
+
+            # apply H_j to trailing columns k > j:  C[:,k] -= tau_j * v * (v^T C[:,k])
+            d = tl.sum(vrow[:, None] * tile, axis=0)  # v^T C over cols
+            upd = tau_j * (vrow[:, None] * d[None, :])
+            tile = tile - tl.where((cols > j)[None, :], upd, 0.0)
+
+            # write column j: R diagonal = beta, essential reflector below, R above
+            # (rows < j) unchanged.
+            colval = tl.where(is_j_row, beta, tl.where(below, colj * gamma, colj))
+            tile = tl.where(is_j_col[None, :], colval[:, None], tile)
+
+            tau_acc = tl.where(is_j_col, tau_j, tau_acc)
+
+    tl.store(ptrs, tile, mask=tile_mask)
+    tau_ptrs = tau_ptr + pid * stride_tb + cols * stride_tj
+    tl.store(tau_ptrs, tau_acc, mask=cmask)
+
+
+def hh_fused_qr(A: torch.Tensor):
+    """Fully-fused batched Householder QR (geqrf format) for small ``n``.
+
+    ``A``: (B, n, n) contiguous float32. Returns ``(H, tau)`` in the
+    ``torch.geqrf`` convention (one Triton program per batch element factors its
+    whole matrix in registers). Intended for small ``n`` only (the tile is
+    ``next_power_of_2(n)`` per program); the caller must dispatch larger shapes
+    elsewhere.
+    """
+    b, n, n2 = A.shape
+    assert n == n2, "A must be square"
+    BLOCK = triton.next_power_of_2(n)
+    H = A.contiguous().clone()
+    tau = torch.empty(b, n, device=A.device, dtype=A.dtype)
+    num_warps = 2 if BLOCK <= 32 else (4 if BLOCK <= 64 else 8)
+    grid = (b,)
+    _hh_fused_qr_kernel[grid](
+        H,
+        H,
+        tau,
+        b,
+        n,
+        H.stride(0),
+        H.stride(1),
+        H.stride(2),
+        H.stride(0),
+        H.stride(1),
+        H.stride(2),
+        tau.stride(0),
+        tau.stride(1),
+        num_warps=num_warps,
+        BLOCK=BLOCK,
+    )
+    return H, tau

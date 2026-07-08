@@ -631,6 +631,69 @@ def make_cholqr_recon(
     return impl
 
 
+def make_hh_fused_smalln(cap: int = 128, base: QRImpl | None = None) -> QRImpl:
+    """Fused single-block Householder QR for small ``n`` (iteration 18).
+
+    For ``n <= cap`` a fully-fused Triton kernel (one program per batch element,
+    the whole matrix factored in registers) returns geqrf-format ``(H, tau)``
+    directly — no library ``geqrf``, no trailing GEMM. This is the small-n,
+    LDS-fitting analogue of the NVIDIA seed's ``qr_fused_kernel`` (ported to
+    Triton so gfx950's 64-lane wavefronts / ~64 KB LDS need no special-casing),
+    and validates the in-register fused-Householder primitive (``house_coeffs``,
+    reflector application, geqrf packing) that the larger panel + GEMM port will
+    reuse.
+
+    The cap is set where the fused kernel is *measured* to beat ``torch.geqrf``:
+    it wins ~2.3-3.5x for ``n`` in 32..128 but only ties / slightly loses by
+    ``n=176`` (0.93x), so shapes above the cap fall through to ``base`` (the
+    current champion, which itself dispatches ``n <= 256`` to ``geqrf``). Thus no
+    non-small shape can regress. Among the benchmark shapes only ``b20 n32`` uses
+    the fused path; everything else is byte-for-byte the champion.
+    """
+    _base = (
+        base
+        if base is not None
+        else make_cholqr_recon(
+            passes=2,
+            lu_block=32,
+            use_triton_modlu_inv=True,
+            use_triton_chol=True,
+            chol_kblock=64,
+            chol_fused_max_n=1024,
+            use_triton_trsm=True,
+            trsm_kblock=64,
+            trsm_fused_max_n=768,
+            shift=True,
+            shift_coef=1.5,
+            batch_repair=True,
+            repair_passes=2,
+            repair_shift_coef=3.0,
+            fused_assembly=True,
+        )
+    )
+
+    def impl(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        n = A.shape[-1]
+        if n <= cap:
+            from .triton_kernels import hh_fused_qr
+
+            a = A if A.is_contiguous() else A.contiguous()
+            # No per-call finiteness sync here: it would add a host sync + two
+            # reductions to every tiny-n call and erase the whole point (the
+            # small-n win is measured in tens of microseconds). The fused kernel
+            # is validated to pass BOTH gates on dense + every stress/degenerate
+            # structure at these sizes (see LOG iteration 18 isolation table);
+            # a genuine breakdown would be caught by the checker gate exactly as
+            # any wrong answer is. Only a compile/launch failure falls back.
+            try:
+                return hh_fused_qr(a)
+            except Exception:  # noqa: BLE001 - any kernel breakdown -> safe baseline
+                return torch.geqrf(a)
+        return _base(A)
+
+    return impl
+
+
 VARIANTS: dict[str, QRImpl] = {
     "blocked_hh_b64": make_blocked_householder(64),
     "cholqr2_recon": make_cholqr_recon(),
@@ -848,6 +911,13 @@ VARIANTS: dict[str, QRImpl] = {
         repair_shift_coef=3.0,
         fused_assembly=True,
     ),
+    # Iteration 18: fused single-block-per-matrix Householder QR for small n
+    # (Triton port of the NVIDIA seed's ``qr_fused_kernel``). Dispatches n<=128
+    # to the fused kernel (measured 2.3-3.5x over geqrf) and everything else to
+    # the champion (``_repair2``), so only b20 n32 changes among the benchmarks.
+    # Foundational: validates the in-register fused-Householder primitive on
+    # gfx950 that the iteration-19 panel + GEMM port will reuse. See LOG iter 18.
+    "hh_fused_smalln": make_hh_fused_smalln(cap=128),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
     "blocked_wy_b96": make_blocked_wy(96),
@@ -926,6 +996,10 @@ VARIANT_INFO: dict[str, VariantInfo] = {
     ),
     "cholqr3_shift_recon_repair2": VariantInfo(
         "fusedasm with lighter batched repair (repair_passes 3->2); best geomean",
+        "active",
+    ),
+    "hh_fused_smalln": VariantInfo(
+        "fused single-block Householder QR for small n (Triton), champion above n=128",
         "active",
     ),
     "blocked_wy_b32": VariantInfo(
