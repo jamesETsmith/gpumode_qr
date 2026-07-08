@@ -42,6 +42,10 @@ def main() -> int:
             f"runs={vh.runs} commits={len(vh.commits)}"
         )
 
+    # Leaderboard-style ranking: geomean of per-shape median_ms per variant.
+    print()
+    print(plotting.format_leaderboard(plotting.build_leaderboard(runs)))
+
     print("\nSaved figures:")
     for p in paths:
         print(f"  {p}")

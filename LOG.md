@@ -15,6 +15,28 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 | b8_n2048_cond1  | 2048 |     8 |      151    |
 | b2_n4096_cond1  | 4096 |     2 |       80    |
 
+## Tooling: geomean ranking metric (re-added)
+
+The cross-shape **geomean ranking metric is back** (branch `tooling/geomean-metric`).
+GPUMODE ranks passing submissions "by runtime using the geometric mean of
+benchmark cases" (`AGENTS.md`), so we compute the geometric mean of the 7
+per-shape `median_ms` values as a single leaderboard-comparable number (lower is
+better). `run_baseline.py` prints it and stores `geomean_median_ms` /
+`geomean_min_ms` in each record's `extra`; `scripts/plot_results.py` prints a
+per-variant leaderboard table (geomean + speedup vs the `torch_geqrf` baseline)
+from the latest db file per variant. Assumption: per-shape median is the case
+runtime. Current standings (from existing db files, MI350X / ROCm 7.2.4):
+
+| variant                         | geomean(median) ms | speedup vs geqrf |
+|---------------------------------|-------------------:|-----------------:|
+| `torch_geqrf` (baseline)        |            42.9948 |            1.00x |
+| `cholqr3_shift_recon_repair2`   |            12.4341 |            3.46x |
+
+So the current best variant is ~**3.46x** faster than the geqrf baseline on the
+geomean metric. (Note the geomean compresses the huge per-shape spread — e.g.
+b640 n512 alone is ~44x — into one leaderboard number; the per-shape breakdown
+above/in `db/` remains the real story.)
+
 ## Active variants
 
 - **`cholqr3_shift_recon_repair2`** (active best, iteration 17) — identical
