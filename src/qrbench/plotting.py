@@ -14,6 +14,7 @@ See :func:`generate_all` for the top-level entry point.
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -174,6 +175,143 @@ def _baseline_medians(runs: Iterable[Run]) -> dict[str, float]:
             if prev is None or sr.median_ms < prev:
                 medians[name] = sr.median_ms
     return medians
+
+
+# ---------------------------------------------------------------------------
+# Leaderboard: cross-shape geomean ranking metric
+# ---------------------------------------------------------------------------
+#
+# The GPUMODE challenge ranks passing submissions "by runtime using the
+# geometric mean of benchmark cases" (AGENTS.md). We reproduce that ranking
+# number here from the local db so it can be compared against the GPUMODE
+# leaderboard without re-running any GPU benchmarks.
+#
+# Assumption: we use each shape's per-shape ``median_ms`` (10 timed runs) as
+# that benchmark case's runtime, and take the geometric mean across the shapes.
+
+
+def _geomean(values: Iterable[float]) -> float:
+    """Geometric mean of positive values (``nan`` if empty)."""
+    vals = list(values)
+    if not vals:
+        return float("nan")
+    return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+
+def _expected_shape_names(runs: Iterable[Run]) -> set[str]:
+    """Canonical benchmark-shape set = union of shape names across all runs.
+
+    All runs benchmark the same ``inputs.BENCHMARK_SHAPES`` (7 shapes), so the
+    union is the full set a "complete" run is expected to cover.
+    """
+    names: set[str] = set()
+    for run in runs:
+        names.update(run.shapes.keys())
+    return names
+
+
+def _latest_run_per_variant(runs: Iterable[Run]) -> dict[str, Run]:
+    """Most recent (by date) db run for each impl."""
+    latest: dict[str, Run] = {}
+    for run in runs:
+        prev = latest.get(run.impl)
+        if prev is None or run.date >= prev.date:
+            latest[run.impl] = run
+    return latest
+
+
+@dataclass
+class LeaderboardRow:
+    impl: str
+    geomean_median_ms: float
+    n_shapes: int
+    n_expected: int
+    complete: bool
+    speedup_vs_baseline: float | None  # baseline_geomean / this_geomean
+    date: datetime
+
+
+def build_leaderboard(runs: Iterable[Run]) -> list[LeaderboardRow]:
+    """Per-variant leaderboard from the latest db run of each variant.
+
+    For each impl, take its most recent db file, compute the geometric mean of
+    the per-shape ``median_ms`` across the benchmark shapes, and the speedup vs
+    the ``torch_geqrf`` baseline's geomean (over the same complete shape set).
+
+    A row is only ranked (and given a speedup) if the run covers all expected
+    shapes; partial runs are still returned but flagged ``complete=False`` so
+    the caller can note them separately. Rows are sorted fastest-first by
+    geomean, with complete runs ranked ahead of partial ones.
+    """
+    runs = list(runs)
+    expected = _expected_shape_names(runs)
+    n_expected = len(expected)
+    latest = _latest_run_per_variant(runs)
+
+    # Baseline geomean over the complete shape set (from the baseline's latest
+    # complete run), used as the speedup reference.
+    baseline_geomean: float | None = None
+    base_run = latest.get(BASELINE_IMPL)
+    if base_run is not None and expected.issubset(base_run.shapes.keys()):
+        baseline_geomean = _geomean(
+            base_run.shapes[name].median_ms for name in expected
+        )
+
+    rows: list[LeaderboardRow] = []
+    for impl, run in latest.items():
+        names = set(run.shapes.keys())
+        complete = expected.issubset(names) and n_expected > 0
+        if complete:
+            gm = _geomean(run.shapes[name].median_ms for name in expected)
+        else:
+            # geomean over whatever shapes exist, for context only
+            gm = _geomean(sr.median_ms for sr in run.shapes.values())
+        speedup = None
+        if complete and baseline_geomean is not None and gm > 0:
+            speedup = baseline_geomean / gm
+        rows.append(
+            LeaderboardRow(
+                impl=impl,
+                geomean_median_ms=gm,
+                n_shapes=len(names),
+                n_expected=n_expected,
+                complete=complete,
+                speedup_vs_baseline=speedup,
+                date=run.date,
+            )
+        )
+
+    rows.sort(key=lambda r: (not r.complete, r.geomean_median_ms))
+    return rows
+
+
+def format_leaderboard(rows: list[LeaderboardRow]) -> str:
+    """Render :func:`build_leaderboard` output as a compact text table."""
+    lines: list[str] = []
+    lines.append(
+        "Leaderboard (geomean of per-shape median_ms; "
+        "lower is better; speedup vs torch_geqrf):"
+    )
+    header = f"  {'variant':<30} {'geomean(median) ms':>20} {'speedup':>10}  shapes"
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for r in rows:
+        if r.complete:
+            speed = f"{r.speedup_vs_baseline:.2f}x" if r.speedup_vs_baseline else "-"
+            shapes = f"{r.n_shapes}/{r.n_expected}"
+        else:
+            speed = "(partial)"
+            shapes = f"{r.n_shapes}/{r.n_expected}*"
+        lines.append(
+            f"  {r.impl:<30} {r.geomean_median_ms:>20.4f} {speed:>10}  {shapes}"
+        )
+    lines.append(
+        "  * partial: run does not cover all benchmark shapes; not ranked."
+    )
+    lines.append(
+        "  assumption: per-shape median_ms is the case runtime for the geomean."
+    )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

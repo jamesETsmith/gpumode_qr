@@ -78,8 +78,14 @@ uv run --with matplotlib python scripts/plot_results.py
   marked as diamonds and benchmark results overlaid on the commit that produced
   them (labeled with impl + best per-shape speedup vs the baseline).
 
-PNGs are git-ignored (regenerable). The script prints the absolute saved paths
-and a short per-variant history summary when it finishes.
+PNGs are git-ignored (regenerable). The script prints the absolute saved paths,
+a short per-variant history summary, and a compact **leaderboard table** when it
+finishes. The leaderboard is computed from the latest `db/*.json` per variant
+and shows, for each variant, the geometric mean of its per-shape `median_ms`
+(the GPUMODE-style ranking metric) and the speedup vs the `torch_geqrf`
+baseline's geomean. Only variants with results for all benchmark shapes are
+ranked; partial runs are listed but flagged. It needs no torch/GPU, so it reads
+straight from `db/` without re-running any benchmarks.
 
 ## Layout
 
@@ -88,7 +94,7 @@ src/qrbench/
   inputs.py     # benchmark shapes + stress-case generators (cond column scaling)
   checker.py    # FP64 correctness gates (factor residual, orthogonality)
   reference.py  # implementation registry; torch_geqrf baseline
-  bench.py      # HIP-event timing (per-shape)
+  bench.py      # HIP-event timing (per-shape) + geomean ranking metric
   dbwrite.py    # results DB writer (provenance + per-shape results)
 scripts/
   run_baseline.py   # correctness + benchmark + DB record
@@ -100,9 +106,14 @@ db/                 # one JSON per run (see AGENTS.md schema)
 
 Each `db/*.json` records: git commit, date, ROCm version, docker image, torch
 version, GPU name, and `benchmark_results` (one entry per shape, each with 10
-timed runs) plus a correctness summary. Timings are reported per shape; we do
-not roll them up into a single cross-shape number (the shapes are too different
-for that to be meaningful).
+timed runs) plus a correctness summary. Timings are primarily reported per
+shape. Each record's `extra` also stores `geomean_median_ms` (and
+`geomean_min_ms`): the geometric mean of the per-shape runtimes, which is the
+**leaderboard ranking metric** — GPUMODE ranks passing submissions "by runtime
+using the geometric mean of benchmark cases" (see `AGENTS.md`). We use each
+shape's `median_ms` as its case runtime. This single number lets us compare
+against the GPUMODE leaderboard; the per-shape breakdown remains the source of
+truth for where time is actually spent.
 
 ## Workflow
 

@@ -10,6 +10,7 @@ Timing methodology:
 
 from __future__ import annotations
 
+import math
 import statistics
 from dataclasses import dataclass, field
 from typing import Callable
@@ -74,3 +75,17 @@ def benchmark(
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))  # milliseconds
     return TimingResult(times_ms=times)
+
+
+def geomean(values: list[float]) -> float:
+    """Geometric mean, used for the cross-shape leaderboard ranking metric.
+
+    The GPUMODE challenge ranks passing submissions "by runtime using the
+    geometric mean of benchmark cases" (AGENTS.md), so this rolls the per-shape
+    case runtimes up into a single scale-invariant number comparable to the
+    leaderboard. Returns ``nan`` for an empty input and raises on non-positive
+    values (a valid runtime is always > 0).
+    """
+    if not values:
+        return float("nan")
+    return math.exp(sum(math.log(v) for v in values) / len(values))

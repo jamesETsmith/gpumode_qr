@@ -66,6 +66,11 @@ def run_benchmarks(fn, device: str, warmup: int, iters: int) -> list[dict]:
             f"median={timing.median:.3f}ms min={timing.min:.3f}ms "
             f"factor={chk.factor_residual:.2e} orth={chk.orth_residual:.2e}"
         )
+    gm_median = bench.geomean([r["timing"]["median_ms"] for r in results])
+    print(
+        f"[bench] geomean(median) across {len(results)} shapes = "
+        f"{gm_median:.4f} ms  (leaderboard-style ranking metric)"
+    )
     return results
 
 
@@ -98,6 +103,17 @@ def main() -> int:
     all_pass = all(r["correctness"]["passed"] for r in bench_results)
     stress_pass = all(r["passed"] for r in stress_results) if stress_results else None
 
+    # Leaderboard-style ranking metric: geometric mean of the per-shape case
+    # runtimes (AGENTS.md ranks passing submissions by the geomean of benchmark
+    # cases). We use per-shape median_ms as the case runtime; also record a
+    # min_ms geomean as a best-case reference.
+    geomean_median_ms = bench.geomean(
+        [r["timing"]["median_ms"] for r in bench_results]
+    )
+    geomean_min_ms = bench.geomean(
+        [r["timing"]["min_ms"] for r in bench_results]
+    )
+
     if not args.no_write:
         meta = dbwrite.collect_metadata(str(REPO_ROOT), args.docker_image)
         path = dbwrite.write_result(
@@ -111,6 +127,8 @@ def main() -> int:
                 "all_benchmarks_pass": all_pass,
                 "stress_pass": stress_pass,
                 "stress_results": stress_results,
+                "geomean_median_ms": geomean_median_ms,
+                "geomean_min_ms": geomean_min_ms,
             },
         )
         print(f"wrote {path}")
