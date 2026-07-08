@@ -3,7 +3,7 @@
 > **Scope.** This note describes the current champion, `hh_panel_tuned`
 > (`CHAMPION` in `src/qrbench/variants.py`), as of commit `28d240d` on `main`.
 > It is meant to be read alongside the code, and it should be updated whenever a
-> new champion is promoted (see the maintenance note in `LOG.md`).
+> new champion is promoted (see the maintenance note in `docs/LOG.md`).
 
 We want to compute the QR factorization of many small square matrices at once,
 as fast as possible, on an AMD MI350X GPU. This is a short lecture on *why* the

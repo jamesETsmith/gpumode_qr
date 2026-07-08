@@ -150,7 +150,7 @@ def modlu_block(blocks: torch.Tensor):
 # substitution and ``U11^{-1}`` (upper, pivot diagonal) by row-backward
 # substitution. The caller then forms ``L21 = A21 @ U11^{-1}`` and
 # ``U12 = L11^{-1} @ B12`` as batched GEMMs (throughput-friendly, whole batch in
-# parallel), mathematically identical to the trsm path. See LOG.md iteration 12.
+# parallel), mathematically identical to the trsm path. See docs/LOG.md iteration 12.
 # ---------------------------------------------------------------------------
 
 
@@ -306,7 +306,7 @@ def modlu_inv_block(blocks: torch.Tensor):
 # launches). The kernel also returns the diagonal block's *inverse* ``L11^{-1}``
 # so the off-diagonal panel ``L21 = A21 L11^{-T}`` and the trailing update
 # ``A22 -= L21 L21^T`` become batched GEMMs (throughput-friendly) instead of
-# serialized trsm. See LOG.md iteration 9.
+# serialized trsm. See docs/LOG.md iteration 9.
 # ---------------------------------------------------------------------------
 
 
@@ -529,7 +529,7 @@ def triu_inv_block(blocks: torch.Tensor):
 # the whole assembly is a single elementwise select. This kernel fuses it into
 # one pass (one program per (batch, row), whole matrix written once), reading
 # ``QtA`` (the kept ``Q^T A`` GEMM output), ``B`` and the per-row sign ``s``.
-# Bit-for-bit identical to the PyTorch assembly. See LOG.md iteration 16.
+# Bit-for-bit identical to the PyTorch assembly. See docs/LOG.md iteration 16.
 # ---------------------------------------------------------------------------
 
 
@@ -780,7 +780,7 @@ def hh_fused_qr(A: torch.Tensor):
 # repair. The whole panel tile lives in registers (not LDS), sidestepping the
 # seed's 232 KB dynamic-smem request that will not fit MI350X's ~64 KB LDS, at
 # the cost of a modest tile (``next_power_of_2(r) x next_power_of_2(w)`` per
-# program) — hence narrow panels (w <= 64). See LOG.md iteration 19.
+# program) — hence narrow panels (w <= 64). See docs/LOG.md iteration 19.
 # ---------------------------------------------------------------------------
 
 

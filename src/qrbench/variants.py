@@ -80,7 +80,7 @@ Lineage (how we got to the champion)
    7.83 -> 7.02 ms (1.12x), n352 1.56 -> 1.50 ms; geomean ~3.01 -> ~3.00 ms.
    All other shapes fall through to the ``hh_panel_gemm`` path (no regression).
 
-See ``LOG.md`` for the full per-iteration reasoning and measurements.
+See ``docs/LOG.md`` for the full per-iteration reasoning and measurements.
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 QRImpl = Callable[..., tuple]
 
-# The single explicit "current best" marker. Kept in sync with LOG.md's active
+# The single explicit "current best" marker. Kept in sync with docs/LOG.md's active
 # best and the leaderboard geomean (see scripts/plot_results.py).
 CHAMPION = "hh_panel_tuned"
 
@@ -935,7 +935,7 @@ VARIANTS: dict[str, QRImpl] = {
     # diagonal-block factorization (one program per batch element). This removes
     # the per-column Python launch overhead that dominates the reconstruction at
     # large n / small batch, while keeping the efficient batched trsm/GEMM
-    # trailing updates. See LOG.md iteration 8.
+    # trailing updates. See docs/LOG.md iteration 8.
     "cholqr2_recon_fused": make_cholqr_recon(passes=2, lu_block=32, use_triton_modlu=True),
     # Iteration 9: identical to ``cholqr2_recon_fused`` (2 passes, fused Triton
     # modified-LU reconstruction) but the CholeskyQR term's batched Cholesky is
@@ -943,7 +943,7 @@ VARIANTS: dict[str, QRImpl] = {
     # w x w block factorization + inverse is a Triton kernel (one program per
     # batch element), with the off-diagonal panel and trailing update as batched
     # GEMM. Attacks the rocSOLVER/rocBLAS batch serialization that dominates the
-    # priority b640 n512 shape. See LOG.md iteration 9.
+    # priority b640 n512 shape. See docs/LOG.md iteration 9.
     "cholqr2_recon_fused2": make_cholqr_recon(
         passes=2,
         lu_block=32,
@@ -959,7 +959,7 @@ VARIANTS: dict[str, QRImpl] = {
     # Triton kernel (one program per batch element), with the off-diagonal
     # corrections + the R_jj^{-1} multiply as batched GEMMs. Attacks the rocBLAS
     # batched-trsm serialization that dominates b640 n512 after iteration 9.
-    # See LOG.md iteration 10.
+    # See docs/LOG.md iteration 10.
     "cholqr2_recon_fused3": make_cholqr_recon(
         passes=2,
         lu_block=32,
@@ -982,7 +982,7 @@ VARIANTS: dict[str, QRImpl] = {
     # The two subsequent unshifted passes restore exact orthonormality so the
     # modified-LU reconstruction is unchanged; the per-element geqrf guard stays
     # for genuinely rank-deficient stress inputs (cheap, small batch). See
-    # LOG.md iteration 11.
+    # docs/LOG.md iteration 11.
     "cholqr3_shift_recon": make_cholqr_recon(
         passes=2,
         lu_block=32,
@@ -1002,7 +1002,7 @@ VARIANTS: dict[str, QRImpl] = {
     # batched GEMMs, using diagonal-block triangular inverses (L11^{-1}, U11^{-1})
     # computed in-register by the fused ``modlu_inv_block`` Triton kernel.
     # Mathematically identical output; attacks the largest remaining compute
-    # component of the priority shape. See LOG.md iteration 12.
+    # component of the priority shape. See docs/LOG.md iteration 12.
     "cholqr3_shift_recon_invlu": make_cholqr_recon(
         passes=2,
         lu_block=32,
@@ -1029,7 +1029,7 @@ VARIANTS: dict[str, QRImpl] = {
     # trsm is NOT extended above 768 (at n1024 fused trsm ~2.8 ms is a touch
     # slower than the library ~2.7 ms, so n1024 keeps the library trsm — the
     # 30.0 vs 30.8 ms measured difference). n<=256 / batch<16 (n2048/n4096)
-    # still dispatch to geqrf, so only n1024 changes. See LOG.md iteration 13.
+    # still dispatch to geqrf, so only n1024 changes. See docs/LOG.md iteration 13.
     "cholqr3_shift_recon_bign": make_cholqr_recon(
         passes=2,
         lu_block=32,
@@ -1055,7 +1055,7 @@ VARIANTS: dict[str, QRImpl] = {
     # the extra unshifted passes remove the bias -> Q orthonormal (~8e-7), so no
     # geqrf is needed on the dense benchmark. The geqrf guard remains ONLY as a
     # last resort for genuinely rank-deficient stress inputs (which do not
-    # converge under any finite shift). See LOG.md iteration 14.
+    # converge under any finite shift). See docs/LOG.md iteration 14.
     "cholqr3_shift_recon_batchfix": make_cholqr_recon(
         passes=2,
         lu_block=32,
@@ -1081,7 +1081,7 @@ VARIANTS: dict[str, QRImpl] = {
     # the PyTorch sign-scale + ``triu`` + ``tril`` + add (~4 full n x n memory
     # passes + temporaries) with one pass. The ``Q^T A`` GEMM is kept unchanged
     # (it is load-bearing for the tight factor gate). Bit-for-bit identical
-    # output to ``_batchfix``. See LOG.md iteration 16.
+    # output to ``_batchfix``. See docs/LOG.md iteration 16.
     "cholqr3_shift_recon_fusedasm": make_cholqr_recon(
         passes=2,
         lu_block=32,
@@ -1116,7 +1116,7 @@ VARIANTS: dict[str, QRImpl] = {
     # (ortho ~1.5e2), so 2 is the floor. Genuinely rank-deficient STRESS inputs
     # (which do not converge under any finite shift) still fall through to the
     # geqrf guard exactly as before. Everything except ``repair_passes`` is
-    # byte-for-byte ``_fusedasm``. See LOG.md iteration 17.
+    # byte-for-byte ``_fusedasm``. See docs/LOG.md iteration 17.
     "cholqr3_shift_recon_repair2": make_cholqr_recon(
         passes=2,
         lu_block=32,
