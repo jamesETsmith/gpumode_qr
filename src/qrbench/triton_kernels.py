@@ -14,6 +14,29 @@ diagonal blocks in parallel, and the 32 column steps run in-register with no
 per-column kernel launches). The off-diagonal panel (``L21``), the row panel
 (``U12``) and the trailing update stay as efficient batched trsm / GEMM, exactly
 as in the pure-PyTorch blocked variant.
+
+Kernels in this module (public wrappers) and where they are load-bearing
+--------------------------------------------------------------------------
+The current **champion** variant ``cholqr3_shift_recon_repair2`` (see
+``variants.py``) uses ALL of these except ``modlu_block`` (superseded by the
+``_inv`` version):
+
+- ``modlu_block``       — modified-LU (no pivot) of a diagonal block; returns
+                          packed (L, U) + sign ``s``. Used by the earlier fused
+                          variants via ``use_triton_modlu`` (NOT the champion).
+- ``modlu_inv_block``   — like ``modlu_block`` but also returns ``L11^-1`` and
+                          ``U11^-1`` so the off-diagonal panel/row solves become
+                          batched GEMMs. **Champion** (``use_triton_modlu_inv``).
+- ``chol_inv_block``    — Cholesky of a diagonal block + its inverse ``L11^-1``
+                          for a GEMM-based blocked Cholesky. **Champion**
+                          (``use_triton_chol``).
+- ``triu_inv_block``    — inverse of an upper-triangular diagonal block for the
+                          GEMM-based Q-forming right-solve. **Champion**
+                          (``use_triton_trsm``).
+- ``assemble_recon``    — single-pass R-assembly: row-sign-scaled ``triu(Q^T A)``
+                          over the modified-LU Householder vectors below the
+                          diagonal, replacing ~4 full n x n PyTorch passes.
+                          **Champion** (``fused_assembly``).
 """
 
 from __future__ import annotations
