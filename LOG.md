@@ -31,15 +31,36 @@ runtime. Current standings (from existing db files, MI350X / ROCm 7.2.4):
 |---------------------------------|-------------------:|-----------------:|
 | `torch_geqrf` (baseline)        |            42.9948 |            1.00x |
 | `cholqr3_shift_recon_repair2`   |            12.4341 |            3.46x |
+| `hh_fused_smalln` (**champion**)|            11.5208 |            3.73x |
 
-So the current best variant is ~**3.46x** faster than the geqrf baseline on the
-geomean metric. (Note the geomean compresses the huge per-shape spread — e.g.
+So the current best variant is ~**3.73x** faster than the geqrf baseline on the
+geomean metric (the iteration-18 fused small-n kernel drops b20 n32 from ~0.118
+to ~0.053 ms, ~2.2x, with every other shape byte-for-byte the prior champion). (Note the geomean compresses the huge per-shape spread — e.g.
 b640 n512 alone is ~44x — into one leaderboard number; the per-shape breakdown
 above/in `db/` remains the real story.)
 
 ## Active variants
 
-- **`cholqr3_shift_recon_repair2`** (active best, iteration 17) — identical
+- **`hh_fused_smalln`** (active best / champion, iteration 18) — a **Triton port
+  of the NVIDIA seed's fully-fused per-matrix Householder QR** (`qr_fused_kernel`).
+  One Triton program per batch element factors its whole `n x n` matrix **in
+  registers** via the sequential Householder column loop (`house_coeffs` +
+  reflector application), packing geqrf-format `(H, tau)` directly — **no library
+  `geqrf`, no trailing GEMM**. Dispatches `n<=128` to the fused kernel and
+  everything above to `cholqr3_shift_recon_repair2` **unchanged** (which itself
+  sends `n<=256` to `geqrf`), so among the 7 benchmark shapes **only b20 n32
+  changes** and no other shape can regress. Chosen vehicle: **Triton** (not
+  HIP/`load_inline`) — it is our proven gfx950 kernel language, is wavefront-
+  agnostic (no 32→64-lane `__shfl` rewrite), and the in-register tile sidesteps
+  the seed's 232 KB dynamic-smem request that won't fit MI350X's ~64 KB LDS. The
+  practical cost is a modest tile cap: `next_power_of_2(n)` per program, which is
+  why the fused path stops at n=128 (measured 2.3–3.5x over geqrf for n∈32..128,
+  but only 0.93x by n=176). **b20 n32 0.118 → 0.053 ms (~2.2x, ~44x is n512);
+  every other shape tied; geomean(median) 12.43 → 11.52 ms.** Both gates + full
+  stress PASS. Foundational: validates the fused in-register Householder
+  primitive that the iteration-19 panel + GEMM port will reuse. See iteration 18.
+- **`cholqr3_shift_recon_repair2`** (superseded as champion by `hh_fused_smalln`
+  but still the active base engine for n>128, iteration 17) — identical
   pipeline to `cholqr3_shift_recon_fusedasm` EXCEPT the batched repair of the ~3
   near-rank-deficient elements at b640 n512 uses **one fewer unshifted refinement
   pass** (`repair_passes` 3 → 2). Iteration-17 profiling of the repair sub-batch
@@ -254,6 +275,148 @@ Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
 
 +`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
 matches baseline there (small diffs are cross-GPU / run noise).
+
+## Iteration 18 — seed analysis, port plan & `hh_fused_smalln` (fused small-n Householder QR)
+
+- Branch: `variant/hh-fused-smalln` (merged `--no-ff` into `main`).
+- New seed: `references/nvidia_winner_sol_combo.md` — the **NVIDIA/CUDA
+  competition winner** (`sol_combo`), provided to learn from and port to gfx950.
+
+### 1. Seed analysis — what it does and why it matters
+
+The winner uses a **different core strategy** than our champion. Instead of
+CholeskyQR-everywhere + Householder reconstruction, it does **direct blocked
+Householder QR** with fully-fused per-matrix panel kernels:
+
+- **Fused Householder panel kernels** (`panel_smem_kernel`, `panel_tall_kernel`):
+  factor a width-`w` panel of one matrix **entirely in shared memory**, one CUDA
+  block per matrix. `panel_core` runs the sequential column loop (per-column
+  `house_coeffs` = slarfg, reflector application) building the WY vectors `P`;
+  `pair_dots` + `t_recurrence` build the **compact-WY `T`** in-kernel. The
+  trailing-matrix update is then a **batched GEMM** (`torch.bmm`, TF32/bf16) —
+  `C -= P (Tᵀ (Pᵀ C))`. This is the classic LAPACK blocked-QR structure but with
+  the whole panel factorization fused into one launch.
+- **Fused single-block Householder QR for small n** (`qr_fused_kernel`, `n<=192`):
+  the *entire* matrix is one panel — `panel_core` over all `n` columns, no
+  trailing GEMM. Direct geqrf `(H, tau)` output.
+- **CholeskyQR + reconstruction** (`chol_recon_kernel`, `larft_kernel`) used
+  **only** for the `n=4096, B=2` path (the shape where GEMM-bound CholeskyQR
+  wins). This is the same family as our champion.
+- **CUDA graphs**, per-shape tuned panel width / thread count, TF32 (optional
+  bf16) trailing GEMMs.
+
+Why it matters: the **fused Householder-panel + GEMM-trailing route is genuinely
+new for us** and avoids the shift/repair machinery entirely (no `A^T A`
+conditioning, no modified-LU sign reconstruction, no batched repair). It is the
+main untested lever on the priority `b640 n512` / `n1024` shapes.
+
+### 2. gfx950 porting reality & vehicle decision
+
+- **Wavefront = 64 lanes** (CUDA warp = 32): every `warp_sum` (`o=16`),
+  `__shfl_xor_sync`, `lane = tid&31`, `wid = tid>>5`, `nw = NT>>5` in the seed is
+  32-lane and must be rewritten for 64-lane semantics if ported as HIP.
+- **LDS ≈ 64 KB/workgroup** on MI350X; the seed requests up to **232 KB dynamic
+  smem** (`cudaFuncAttributeMaxDynamicSharedMemorySize 232448`) — not available.
+  A full `n x n` matrix in smem only fits up to `n ≈ 124` (`(n|1)·n·4 ≤ 64 KB`);
+  even `qr_fused_kernel`'s `n<=192` target does **not** fit as-is (n=176 needs
+  ~124 KB).
+- **Vehicle chosen: Triton.** For the *small-n fused QR* de-risking piece,
+  Triton is lower-risk than HIP+hipify: it is wavefront-agnostic (no `__shfl`
+  rewrite), it is our existing proven kernel language on gfx950 (all champion
+  kernels are Triton; smoke test passes), and a **one-program-per-matrix**
+  kernel with a sequential column loop + whole-tile reductions is exactly the
+  pattern our `modlu_inv_block` / `chol_inv_block` kernels already use. The
+  matrix lives **in registers** (not LDS), sidestepping the 64 KB budget, at the
+  cost of a modest tile size (`next_power_of_2(n)` per program). The full
+  in-block panel kernel with the sequential T-recurrence is harder to express in
+  Triton and is deferred to iteration 19 (may still warrant HIP there).
+
+### 3. Prioritized port plan (for iterations 18→)
+
+1. **[iter 18, DONE] Fused single-block Householder QR for small n** (this
+   iteration) — de-risk the fused in-register Householder primitive
+   (`house_coeffs`, reflector application, geqrf `(H, tau)` packing) in Triton.
+   Low-weight in the geomean but unblocks everything below.
+2. **[iter 19, NEXT] Fused Householder PANEL + GEMM trailing** — the high-value
+   item: challenge the CholeskyQR champion on `b640 n512` and `n1024`. Port
+   `panel_core` (panel factorization → WY vectors) + `t_recurrence` (compact-WY
+   `T`) to a per-matrix kernel, then do `C -= P(Tᵀ(PᵀC))` as batched `bmm`. This
+   is where a Householder route could beat the ~58 ms shift/recon/repair
+   pipeline (no `A^T A` conditioning, no reconstruction, no repair). Decide
+   Triton-vs-HIP per how hard the T-recurrence is to express.
+3. **[later] CUDA/HIP graphs** for the panel-loop launch overhead (we already
+   use `torch.cuda.CUDAGraph` for the CholeskyQR path; extend to the panel loop).
+4. **[later] TF32/bf16 trailing GEMMs** for the panel update (iteration 15 found
+   bf16 hurt the CholeskyQR gate, but the direct-Householder R is exact so the
+   trailing GEMM precision has more headroom — re-test under this route).
+
+### 4. Iteration-18 implementation — `hh_fused_smalln`
+
+- Triton smoke test on gfx950 **confirmed OK** first (`scripts/triton_smoke.py`,
+  `max_err=0`).
+- `hh_fused_qr` kernel (`triton_kernels.py`): one program per batch element loads
+  the `n x n` matrix as a `next_power_of_2(n)` tile, runs the sequential
+  Householder column loop with whole-tile reductions (`house_coeffs` = slarfg:
+  `beta=-sign(alpha)·‖·‖`, `tau=(beta-alpha)/beta`, essential
+  `v = A[j+1:,j]/(alpha-beta)`), applies each reflector to the trailing columns
+  in-register, and writes geqrf-format `(H, tau)`. Degenerate columns
+  (`sigma<=0`) give `tau=0` (identity), matching `slarfg`.
+- Variant `hh_fused_smalln` dispatches `n<=128` to the kernel, else to
+  `cholqr3_shift_recon_repair2` unchanged. **No per-call finiteness sync** on the
+  fused path (it would add a host sync + reductions to every tens-of-µs call and
+  erase the win); a compile/launch failure falls back to `geqrf`.
+
+### 5. Correctness — isolation + full harness gates
+
+- **Isolation** (`scripts/hh_fused_isolation.py`, GPU 2): BOTH FP64 gates PASS
+  for dense + column-scaled inputs at n ∈ {8,16,32,48,64,96,128} (and n up to
+  256 in a follow-up) across batch ∈ {1,4,20}, **and every stress structure at
+  n=32** (dense cond1/4, rank_deficient, near_rank_deficient, banded, row_scaled,
+  near_collinear, upper_triangular, clustered_scale). Typical n=32 residuals
+  factor ~2e-7 (gate 7.6e-5), orth ~2e-6 (gate 3.8e-4); upper_triangular is
+  exact (0.0). Reflector-sign diffs vs `geqrf` on degenerate inputs are expected
+  and irrelevant (the gates are what count).
+- **Full harness** `GPU=2 … --impl hh_fused_smalln --stress --warmup 3 --iters 3`:
+  **ALL 7 benchmark shapes + the FULL stress suite (27 cases) PASS both gates.**
+
+### 6. Performance (detached 10/10 DB run, GPU 2)
+
+| shape           |    n | batch |  geqrf | champion (repair2) | hh_fused_smalln | vs champion | vs geqrf |
+|-----------------|-----:|------:|-------:|-------------------:|----------------:|------------:|---------:|
+| b20_n32_cond1   |   32 |    20 |   0.119| 0.118              | **0.053**       | **2.2x**    | **2.2x** |
+| b40_n176_cond1  |  176 |    40 |   1.60 | 1.498              | 1.493           | tie         | tie      |
+| b40_n352_cond1  |  352 |    40 | 102    | 8.142              | 8.155           | tie         | 12.5x    |
+| b640_n512_cond2 |  512 |   640 |2572    | 58.068             | 59.947          | tie*        | ~43x     |
+| b60_n1024_cond2 | 1024 |    60 | 523    | 46.335             | 46.859          | tie*        | 11.2x    |
+| b8_n2048_cond1  | 2048 |     8 | 151    | 148.031            | 167.611         | tie*        | tie*     |
+| b2_n4096_cond1  | 4096 |     2 |  80    | 79.394             | 88.116          | tie*        | tie*     |
+| **geomean(median)** |  |       | 42.99  | **12.43**          | **11.52**       | **1.08x**   | **3.73x**|
+
+*n∈{512,1024,2048,4096} run the **identical** `cholqr3_shift_recon_repair2` code
+path; the small deltas are cross-run/GPU noise (the earlier repair2 DB numbers
+came from GPU 5). Same-GPU-2 head-to-head (warmup 10/iters 20) confirmed the only
+real change: **b20 n32 0.051 ms (fused) vs 0.118 ms (champion/geqrf) — 2.3x**,
+b40 n176 identical (1.614 vs 1.596).
+
+- **Decision: PROMOTE to champion + merge `--no-ff`.** It is a strict geomean
+  improvement (12.43 → 11.52 ms, ~7% / 1.08x) with no regressions (every non-
+  small shape is byte-for-byte the prior champion), and — more importantly —
+  delivers a **working, correct fused in-register Householder kernel on gfx950**,
+  the foundational primitive for the high-value panel port.
+
+### 7. Recommendation for iteration 19
+
+- **Port the fused Householder PANEL kernel + GEMM trailing** (plan item 2) to
+  challenge the CholeskyQR champion on `b640 n512` / `n1024`. Reuse the
+  now-validated `hh_fused_qr` inner loop as the `panel_core` for a width-`w`
+  panel (`w ≈ 32–64` so the `r x w` panel tile fits registers), add the
+  compact-WY `T` build (`pair_dots` + `t_recurrence`), and do the trailing update
+  `C -= P(Tᵀ(PᵀC))` as batched `bmm`. This is the direct-Householder route that
+  avoids `A^T A` conditioning + reconstruction + repair — the only remaining
+  structural lever on the ~58 ms priority shape. If the sequential T-recurrence
+  proves awkward in Triton, evaluate a HIP `load_inline` panel kernel with the
+  wavefront-64 / LDS fixes documented above (verify a trivial HIP kernel compiles
+  on gfx950 first). Keep the fused small-n path as-is (converged).
 
 ## Iteration 17 — `cholqr3_shift_recon_repair2` (lighter batched repair)
 
