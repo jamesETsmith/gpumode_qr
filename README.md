@@ -3,11 +3,22 @@
 Extending the GPUMODE **batched square compact-Householder QR** challenge to AMD
 GPUs (AMD Instinct MI350X, `gfx950`, ROCm 7.2.4).
 
-See [`SUMMARY.md`](SUMMARY.md) for a short (<300-word) summary of where the
-project stands, and [`AGENTS.md`](AGENTS.md) for the full task description,
+See [`docs/SUMMARY.md`](docs/SUMMARY.md) for a short (<300-word) summary of where
+the project stands, and [`AGENTS.md`](AGENTS.md) for the full task description,
 rules, and the official benchmark shapes. See
 [`docs/champion_kernel.md`](docs/champion_kernel.md) for a teaching-style
 walkthrough of the current best kernel.
+
+## Documentation
+
+Prose docs live under [`docs/`](docs/):
+
+- [`docs/SUMMARY.md`](docs/SUMMARY.md) — short (<300-word) overview of the
+  project's goal, approach, and current results.
+- [`docs/LOG.md`](docs/LOG.md) — the research-loop log: every variant tried,
+  its measurements, and the win/tie/lose/kill decisions, newest first.
+- [`docs/champion_kernel.md`](docs/champion_kernel.md) — teaching-style
+  walkthrough of the current champion kernel (`hh_panel_tuned`).
 
 ## Task in one paragraph
 

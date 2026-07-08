@@ -5,7 +5,7 @@ Provenance: the winning submission to the GPUMODE batched QR competition on
 to an analogous **HIP/Triton** solution for AMD MI350X (`gfx950`). It is kept
 here for study only; it does not run on AMD as-is.
 
-Key techniques (see analysis in `LOG.md`):
+Key techniques (see analysis in `docs/LOG.md`):
 - Fully-fused per-matrix Householder **panel kernels** (`panel_smem_kernel`,
   `panel_tall_kernel`): factor a width-`w` panel entirely in shared memory (one
   CUDA block per matrix), producing the WY vectors `P` and the compact-WY `T`
