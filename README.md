@@ -3,8 +3,9 @@
 Extending the GPUMODE **batched square compact-Householder QR** challenge to AMD
 GPUs (AMD Instinct MI350X, `gfx950`, ROCm 7.2.4).
 
-See [`AGENTS.md`](AGENTS.md) for the full task description, rules, and the
-official benchmark shapes.
+See [`SUMMARY.md`](SUMMARY.md) for a short (<300-word) summary of where the
+project stands, and [`AGENTS.md`](AGENTS.md) for the full task description,
+rules, and the official benchmark shapes.
 
 ## Task in one paragraph
 
