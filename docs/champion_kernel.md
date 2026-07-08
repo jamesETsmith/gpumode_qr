@@ -1,7 +1,7 @@
 # The champion kernel: a batched blocked-Householder QR
 
 > **Scope.** This note describes the current champion, `hh_panel_tuned`
-> (`CHAMPION` in `src/qrbench/variants.py`), as of commit `28d240d` on `main`.
+> (`CHAMPION` in `src/qrbench/variants.py`), benchmarked at commit `7d5d216`.
 > It is meant to be read alongside the code, and it should be updated whenever a
 > new champion is promoted (see the maintenance note in `docs/LOG.md`).
 
@@ -146,18 +146,26 @@ with smaller residuals. Removing the repair path is both simpler and faster.
 ## 6. Results
 
 Champion `hh_panel_tuned`, MI350X (`gfx950`, ROCm 7.2.4, PyTorch 2.10), medians
-of 10 runs, versus the `torch.geqrf` baseline.
+of 10 runs, versus the `torch.geqrf` baseline. Source: `db/20260707T121242Z_torch_geqrf.json`
+and `db/20260708T044736Z_hh_panel_tuned.json`.
 
-| shape ($b \times n$) | cond | median (ms) | note |
-|---|---|---|---|
-| $20 \times 32$ | 1 | 0.053 | fused small-$n$ path |
-| $40 \times 176$ | 1 | 0.74 | |
-| $40 \times 352$ | 1 | 1.50 | |
-| $640 \times 512$ | 2 | **6.97** | priority shape (baseline ~2.57 s) |
-| $60 \times 1024$ | 2 | 8.02 | |
-| $8 \times 2048$ | 1 | 16.37 | occupancy-bound (batch 8) |
-| $2 \times 4096$ | 1 | 41.0 | occupancy-bound (batch 2) |
-| **geomean(median)** | | **≈ 3.00** | **≈ 14.33× vs `torch.geqrf`** |
+| shape ($b \times n$) | cond | baseline (ms) | champion (ms) | speedup |
+|---|---|---:|---:|---:|
+| $20 \times 32$ | 1 | 0.12 | 0.053 | 2.24× |
+| $40 \times 176$ | 1 | 1.39 | 0.74 | 1.89× |
+| $40 \times 352$ | 1 | 102 | 1.50 | **67.9×** |
+| $640 \times 512$ | 2 | 2572 | 6.97 | **369×** |
+| $60 \times 1024$ | 2 | 523 | 8.02 | 65.2× |
+| $8 \times 2048$ | 1 | 151 | 16.37 | 9.21× |
+| $2 \times 4096$ | 1 | 80 | 41.0 | 1.95× |
+| **geomean(median)** | | **43.0** | **3.00** | **14.33×** |
+
+The **geomean speedup of 14.33×** is the GPUMODE ranking metric: the geometric
+mean of the seven per-shape medians (43.0 → 3.00 ms). Per-shape speedups are
+baseline/champion. The largest wins are on the large-batch mid-size shapes where
+rocSOLVER serializes (`b{=}640, n{=}512` and `b{=}40, n{=}352`); at `n{=}4096`
+and `n{=}32` the baseline is already competitive and the gain is modest. The
+`n{=}2048`/`n{=}4096` champion times are occupancy-bound (batch 8/2).
 
 Correctness: all 7 benchmark shapes and the full 27-case stress suite pass both
 FP64 gates with comfortable margin (e.g. at $n=512$: factor residual $\sim 5\times10^{-7}$

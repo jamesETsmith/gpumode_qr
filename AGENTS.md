@@ -65,4 +65,5 @@ LOOP FOREVER:
 3. Implement new variants.
 4. Run the benchmarks on these new variants (one at a time) and update results db
 5. If a variant hasn't improved performance for 3 iterations, kill it and remove it from our list of actively developed variants. Update text records of what we've tried and why we killed it and what's been working well.
-6. Start the loop over.
+6. Update docs/champion_kernel.md with the new champion kernel explanation.
+7. Start the loop over.

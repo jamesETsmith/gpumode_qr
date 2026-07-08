@@ -15,6 +15,59 @@ Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 | b8_n2048_cond1  | 2048 |     8 |      151    |
 | b2_n4096_cond1  | 4096 |     2 |       80    |
 
+## Iterations 28–37 — HIP/C++ research (`variant/hip-research`)
+
+Profiling: `docs/hip_profiling/` (rocprofv3 kernel traces). Summary: `docs/hip_research_summary.md`.
+
+Champion reference: `hh_panel_tuned` geomean **3.00 ms** (14.33× vs geqrf).
+
+| iter | branch | variant | geomean ms | vs champion | status |
+|-----:|--------|---------|----------:|------------:|--------|
+| 28 | `variant/hip-iter-28-panel-reg` | `hip_panel_reg` | 5.90 | 1.97× slower | correct; LDS panel+bmm |
+| 29 | `variant/hip-iter-29-fused-smalln` | `hip_fused_smalln` | 6.34 | 2.11× slower | HIP small-n slower than Triton |
+| 30 | `variant/hip-iter-30-fused-trailing` | `hip_panel_fused_trailing` | — | — | **KILLED** (column trailing 100–300× slower) |
+| 31 | `variant/hip-iter-31-nt1024` | `hip_panel_reg_nt1024` | 5.79 | 1.93× slower | small win from NT=1024 |
+| 32 | `variant/hip-iter-32-profile` | (profile) | — | — | HIP panel 61% vs Triton 41% at n512 |
+| 33 | `variant/hip-iter-33-hybrid-smalln` | `hip_hybrid_triton_smalln` | 5.91 | 1.97× slower | Triton small-n + HIP panel |
+| 34 | `variant/hip-iter-34-lds-sweep` | (analysis) | — | — | LDS budget forces w≤3 at n4096 |
+| 35 | `variant/hip-iter-35-profile-n2048` | (profile) | — | — | Champion panel 54% at b8_n2048 |
+| 36 | `variant/hip-iter-36-reg-prototype` | (code) | — | — | global-streaming panel prototype buggy; LDS fallback |
+| 37 | `variant/hip-research` | (summary) | 5.79 best | 1.93× slower | **best HIP** = `hip_panel_reg_nt1024`; no champion |
+
+### Iteration 28 — `hip_panel_reg` (HIP LDS panel + bmm, Variant A)
+
+- Branch: `variant/hip-iter-28-panel-reg` / parent `variant/hip-research`
+- HIP `load_inline` port of iter-23 `panel_smem` (wavefront-64, 64 KB LDS). Dynamic per-step
+  panel width via `hip_panel_width_for_r`. Trailing = `torch.bmm` (same as champion).
+- **rocprofv3** (iter 32): at b640_n512 HIP `panel_smem` is **61%** of kernel time vs Triton
+  `hh_panel_qr` **41%** — HIP panel is ~2.9× slower per profile window.
+- geomean **5.90 ms** (1.97× champion). All 7 shapes PASS. n4096 **83.6 ms** vs champion **41 ms**
+  (LDS forces w=2–3 panels).
+
+### Iteration 29 — `hip_fused_smalln` (Variant B)
+
+- HIP fused whole-matrix QR for n≤128; HIP panel for n>128.
+- HIP `qr_fused_smalln` slower than Triton on n32 (0.09 vs 0.05 ms). geomean **6.34 ms**.
+
+### Iteration 30 — `hip_panel_fused_trailing` (Variant C) — KILLED
+
+- Fused trailing kernel (column-at-a-time) correct after `C.copy_` fix but **catastrophically slow**
+  (`db/20260708T203814Z_hip_panel_fused_trailing.json`): n512 **801 ms**, n2048 **5179 ms** vs 13/26 ms for bmm path. **Killed** — profiling shows
+  rocBLAS GEMM is 45% of champion; must use library GEMM not naive column loops.
+
+### Iteration 31 — `hip_panel_reg_nt1024`
+
+- Panel launches with NT=1024. geomean **5.79 ms** (1.93× champion); marginal n512/n2048 win.
+
+### Iterations 32–37 — profiling + analysis loop
+
+- **32**: rocprofv3 on `hip_panel_reg` + champion (see `docs/hip_profiling/iter28_*`, `iter32_*`).
+- **33**: `hip_hybrid_triton_smalln` — geomean 5.91 ms; no gain (large-n still HIP-limited).
+- **34**: LDS byte sweep (`hip_panel_width_for_r`): r=4096 → w≤3 only; explains iter-23 cliff.
+- **35**: Champion at b8_n2048: panel 54%, GEMM fragmented across many launches.
+- **36**: Register/global-streaming panel prototype had workspace aliasing bug; reverted to LDS panel.
+- **37**: Best HIP = **`hip_panel_reg_nt1024`** geomean 5.79 ms. **Does not beat champion.**
+
 ## Tooling: geomean ranking metric (re-added)
 
 The cross-shape **geomean ranking metric is back** (branch `tooling/geomean-metric`).
@@ -282,6 +335,9 @@ in the iteration-19 entry / `db/` remains the real story.)
 - `blocked_hh_b64` (iteration 1) — blocked QR via `torch.geqrf`+`torch.ormqr`;
   slower than baseline everywhere because both primitives serialize over the
   batch. Kept in registry for reference; not developed further.
+- `hh_panel_hybrid` (iteration 27) — CQR dispatch for n4096 B≤8; passes gates but
+  **2.83× slower** than champion (116 ms vs 41 ms; library CQR serializes at B=2).
+  Not merged. See `docs/qr_gpu_algorithms_survey.md`.
 
 ## Best per-shape median (ms) so far
 
@@ -325,6 +381,65 @@ Updated best per shape after iteration 6 (`cholqr2_recon_blk`, 10 runs, GPU 5):
 
 +`cholqr2_recon_blk` also falls back to geqrf for batch<16 (n2048/n4096), so it
 matches baseline there (small diffs are cross-GPU / run noise).
+
+## Iteration 27 — literature survey + `hh_panel_hybrid` (CQR for n4096 B≤8) — NEGATIVE, not merged
+
+- Branch: `variant/hh-panel-hybrid-cqr` (**NOT merged** into `main`; champion stays
+  `hh_panel_tuned`). Survey doc: `docs/qr_gpu_algorithms_survey.md`.
+- Direction: after a literature survey of GPU batched FP32 QR algorithms, the last
+  untried structural lever from iter 23–24 was **hybrid dispatch** — route
+  `n=4096, batch≤8` to `cholqr3_shift_recon_repair2` (NVIDIA seed uses
+  CholeskyQR there; panel is occupancy-bound at B=2). All other shapes delegate
+  to `hh_panel_tuned` byte-identically.
+
+### 1. Literature survey (`docs/qr_gpu_algorithms_survey.md`)
+
+- Catalogued 20 GPU QR algorithm families (Householder blocked/WY, MAGMA fusion
+  tiers, TSQR/CAQR, CholeskyQR variants, Givens, mixed-precision, library paths,
+  scheduling tricks).
+- Gap analysis vs 24 iterations of project work: **most high-ROI ideas already
+  tried and negative** (iters 20–26 on unmerged branches: HIP graphs, bf16
+  trailing, LDS panel, two-level WY, cooperative grid.sync, look-ahead).
+- Remaining untried levers ranked: (1) CQR hybrid for n4096 B≤8, (2) MAGMA
+  fused panel+trailing for late panels, (3) Givens for tiny n, (4) left-looking QR.
+
+### 2. Implementation — `hh_panel_hybrid`
+
+- `make_hh_panel_hybrid(cqr_n=4096, cqr_max_batch=8)`: champion panel route
+  everywhere except `n==4096 ∧ batch≤8` → `cholqr3_shift_recon_repair2` with
+  `min_batch=1` (lowers the usual `batch>=16` gate so CQR actually runs at B=2).
+- Correctness: **ALL 7 benchmark shapes + full 27-case stress PASS both FP64
+  gates** (`--stress`, GPU 2).
+
+### 3. Performance — decisively SLOWER on the target shape
+
+Same-GPU-2 head-to-head (`--compare`, 10 iters):
+
+| shape           | `hh_panel_hybrid` | `hh_panel_tuned` |     Δ    |
+|-----------------|------------------:|-----------------:|:--------:|
+| b2_n4096_cond1  | **116.4 ms**      | **41.1 ms**      | **0.35× (2.83× slower)** |
+| all other shapes| tied (±noise)     | champion path    | ~1.00×   |
+| **geomean(median)** | **3.49 ms**   | **3.03 ms**      | **1.15× slower** |
+
+Detached 10/10 DB: `db/20260708T193432Z_hh_panel_hybrid.json`, geomean 3.53 ms.
+
+### 4. Root cause
+
+- At `n=4096` our CQR stack uses **library blocked Cholesky** (`n>1024` exceeds
+  the fused-Cholesky gate) and **library trsm** — rocSOLVER/rocBLAS paths that
+  **serialize over the tiny batch** (B=2), exactly the failure mode the panel
+  champion avoids. The NVIDIA seed's n4096 CQR win relies on custom GEMM-bound
+  kernels + TF32 tensor cores, not our ROCm library CQR pipeline.
+- **The panel route at 41 ms already beats geqrf (80 ms) by 2×** on this shape;
+  CQR at 116 ms is worse than *both*.
+
+### 5. Decision — DO NOT MERGE; research loop converged
+
+- Hybrid CQR fails the guardrail (2.83× slower on the only shape it changes).
+- Combined with iters 20–26 negatives, **no literature-sourced lever remains
+  with plausible ROI on MI350X** for batched square FP32 geqrf-format QR.
+- Champion `hh_panel_tuned` unchanged. Survey recommends winding down; remaining
+  tuning (num_stages, rocBLAS alternatives) is <5% geomean upside at best.
 
 ## Iteration 21 — `hh_panel_tuned` (per-shape panel-width × num_warps autotune)
 
