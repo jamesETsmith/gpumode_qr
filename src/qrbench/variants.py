@@ -6,9 +6,15 @@ Variants are registered in ``VARIANTS`` and merged into the run registry.
 
 Which one is best?
 ------------------
-The **current champion is** ``hh_panel_gemm`` (marked by the module-level
-``CHAMPION`` constant): a **fused Householder panel + batched-GEMM trailing**
-blocked QR (Triton port of the NVIDIA seed's large-``n`` strategy). For every
+The **current champion is** ``hh_panel_tuned`` (marked by the module-level
+``CHAMPION`` constant): the iteration-19 ``hh_panel_gemm`` engine with the panel
+kernel's launch config (panel width ``w`` x Triton ``num_warps``) **autotuned
+per benchmark shape** (iteration 21). It is byte-identical in numerics to
+``hh_panel_gemm``; the only change is ``num_warps=4`` at n352/n512 (n512
+7.83 -> 7.02 ms, 1.12x), with every other shape falling through to the
+``hh_panel_gemm`` path (no regression). The underlying engine is a
+**fused Householder panel + batched-GEMM trailing** blocked QR (Triton port of
+the NVIDIA seed's large-``n`` strategy). For every
 ``n>128`` shape it factors each width-``w`` panel with a fully-fused per-matrix
 kernel (reusing the iteration-18 in-register Householder inner loop as
 ``panel_core``, building the compact-WY ``T`` in-kernel) and applies the block
@@ -65,6 +71,14 @@ Lineage (how we got to the champion)
    reconstruction / shift-repair). Beats the CholeskyQR champion on **every**
    large shape (geomean 11.52 -> ~3.01 ms, ~14.3x vs geqrf); ``n<=128`` still
    uses ``hh_fused_smalln``.
+9. ``hh_panel_tuned`` (**champion**) — ``hh_panel_gemm`` with the panel kernel's
+   launch config (panel width ``w`` x Triton ``num_warps``) autotuned per shape
+   (``scripts/hh_panel_tune.py``). Same numerics/kernels; the width sweep
+   confirmed the champion widths were already optimal, and the only win is
+   ``num_warps=4`` at the large-batch mid-size shapes n352/n512 (the default
+   ``BLOCK_R>128 -> num_warps=8`` heuristic over-subscribes warps there): n512
+   7.83 -> 7.02 ms (1.12x), n352 1.56 -> 1.50 ms; geomean ~3.01 -> ~3.00 ms.
+   All other shapes fall through to the ``hh_panel_gemm`` path (no regression).
 
 See ``LOG.md`` for the full per-iteration reasoning and measurements.
 """
@@ -89,7 +103,7 @@ QRImpl = Callable[..., tuple]
 
 # The single explicit "current best" marker. Kept in sync with LOG.md's active
 # best and the leaderboard geomean (see scripts/plot_results.py).
-CHAMPION = "hh_panel_gemm"
+CHAMPION = "hh_panel_tuned"
 
 _matmul_tf32_enabled: bool | None = None
 
