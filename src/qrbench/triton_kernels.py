@@ -753,3 +753,208 @@ def hh_fused_qr(A: torch.Tensor):
         BLOCK=BLOCK,
     )
     return H, tau
+
+
+# ---------------------------------------------------------------------------
+# Iteration 19: fused Householder PANEL factorization + compact-WY ``T`` build.
+#
+# The high-value port of the NVIDIA seed's large-n strategy (blocked Householder
+# QR): factor a width-``w`` panel of the current trailing matrix with a fully
+# fused per-matrix kernel (one Triton program per batch element), then apply the
+# panel's reflectors to the trailing submatrix as a batched GEMM on the host.
+#
+# This kernel reuses the validated iteration-18 fused Householder inner loop
+# (``house_coeffs`` = slarfg, reflector application, geqrf packing) as the panel
+# ``panel_core``, but on a rectangular ``r x w`` panel tile (r = remaining rows,
+# w = panel width). It additionally emits:
+#   * ``V`` — the unit-lower reflector matrix (r x w: 1 on the diagonal, the
+#     essential reflector below it, 0 above) used directly by the trailing GEMM;
+#   * ``T`` — the compact-WY (Schreiber-Van Loan) factor (w x w upper), built
+#     in-kernel via the forward LARFT recurrence from ``W = Vᵀ V`` and ``tau``
+#     (the seed's ``pair_dots`` + ``t_recurrence``, expressed as in-register
+#     tile reductions instead of 32-lane warp shuffles).
+# The host then does ``C -= V @ (Tᵀ @ (Vᵀ @ C))`` with ``torch.bmm``.
+#
+# Being direct Householder, the panel route is unconditionally stable: no
+# ``AᵀA`` conditioning, no modified-LU sign reconstruction, no shifted-CQR
+# repair. The whole panel tile lives in registers (not LDS), sidestepping the
+# seed's 232 KB dynamic-smem request that will not fit MI350X's ~64 KB LDS, at
+# the cost of a modest tile (``next_power_of_2(r) x next_power_of_2(w)`` per
+# program) — hence narrow panels (w <= 64). See LOG.md iteration 19.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _hh_panel_kernel(
+    A_ptr,  # (B, r, w) panel input
+    H_ptr,  # (B, r, w) factored panel output (geqrf packing: R upper, v below)
+    V_ptr,  # (B, r, w) reflector matrix (unit lower)
+    tau_ptr,  # (B, w) reflector coefficients
+    T_ptr,  # (B, w, w) compact-WY T factor (upper)
+    b,  # batch size
+    r,  # panel rows (<= BLOCK_R)
+    w,  # panel width (<= BLOCK_W)
+    stride_ab,
+    stride_ai,
+    stride_aj,
+    stride_hb,
+    stride_hi,
+    stride_hj,
+    stride_vb,
+    stride_vi,
+    stride_vj,
+    stride_tb,
+    stride_tj,
+    stride_Tb,
+    stride_Ti,
+    stride_Tj,
+    BLOCK_R: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """Householder factor one ``r x w`` panel per program + compact-WY ``T``.
+
+    Same ``slarfg`` convention as ``_hh_fused_qr_kernel`` (validated iteration
+    18): for each of the ``w`` panel columns build the reflector from ``A[j:,j]``
+    (``beta = -sign(alpha)*||.||``, ``tau = (beta-alpha)/beta``, essential ``v =
+    A[j+1:,j]/(alpha-beta)``), apply it to the trailing panel columns, and pack
+    geqrf-style. Then emit ``V`` (unit-lower reflectors) and build ``T`` (w x w
+    upper) via the forward LARFT recurrence.
+    """
+    pid = tl.program_id(0)
+    if pid >= b:
+        return
+
+    rows = tl.arange(0, BLOCK_R)
+    cols = tl.arange(0, BLOCK_W)
+    rmask = rows < r
+    cmask = cols < w
+    tile_mask = rmask[:, None] & cmask[None, :]
+
+    base = A_ptr + pid * stride_ab
+    ptrs = base + rows[:, None] * stride_ai + cols[None, :] * stride_aj
+    tile = tl.load(ptrs, mask=tile_mask, other=0.0)
+
+    tau_acc = tl.zeros((BLOCK_W,), dtype=tile.dtype)
+
+    for j in range(0, BLOCK_W):
+        if j < w:
+            is_j_col = cols == j
+            is_j_row = rows == j
+            below = rows > j
+            colj = tl.sum(tl.where(is_j_col[None, :], tile, 0.0), axis=1)
+            alpha = tl.sum(tl.where(is_j_row, colj, 0.0))
+            sigma = tl.sum(tl.where(below, colj * colj, 0.0))
+
+            safe = sigma > 0.0
+            norm = tl.sqrt(alpha * alpha + sigma)
+            beta_full = -tl.where(alpha >= 0.0, norm, -norm)
+            tau_j = tl.where(safe, (beta_full - alpha) / beta_full, 0.0)
+            gamma = tl.where(safe, 1.0 / (alpha - beta_full), 0.0)
+            beta = tl.where(safe, beta_full, alpha)
+
+            vrow = tl.where(is_j_row, 1.0, tl.where(below, colj * gamma, 0.0))
+            d = tl.sum(vrow[:, None] * tile, axis=0)
+            upd = tau_j * (vrow[:, None] * d[None, :])
+            tile = tile - tl.where((cols > j)[None, :], upd, 0.0)
+
+            colval = tl.where(is_j_row, beta, tl.where(below, colj * gamma, colj))
+            tile = tl.where(is_j_col[None, :], colval[:, None], tile)
+
+            tau_acc = tl.where(is_j_col, tau_j, tau_acc)
+
+    # Factored panel (geqrf packing) and tau.
+    tl.store(
+        H_ptr + pid * stride_hb + rows[:, None] * stride_hi + cols[None, :] * stride_hj,
+        tile,
+        mask=tile_mask,
+    )
+    tl.store(tau_ptr + pid * stride_tb + cols * stride_tj, tau_acc, mask=cmask)
+
+    # V (unit lower): 1 on the diagonal, essential reflector below, 0 above.
+    Vmat = tl.where(
+        rows[:, None] > cols[None, :],
+        tile,
+        tl.where(rows[:, None] == cols[None, :], 1.0, 0.0),
+    )
+    Vmat = tl.where(tile_mask, Vmat, 0.0)
+    tl.store(
+        V_ptr + pid * stride_vb + rows[:, None] * stride_vi + cols[None, :] * stride_vj,
+        Vmat,
+        mask=tile_mask,
+    )
+
+    # Compact-WY T (w x w upper) via the forward LARFT recurrence:
+    #   T[i,i] = tau[i];  T[0:i, i] = -tau[i] * (T[0:i,0:i] @ (V[:,0:i]ᵀ V[:,i]))
+    tw = tl.arange(0, BLOCK_W)
+    Tmat = tl.zeros((BLOCK_W, BLOCK_W), dtype=tile.dtype)
+    for i in range(0, BLOCK_W):
+        if i < w:
+            # column i of V, over rows.
+            vi = tl.sum(tl.where(cols[None, :] == i, Vmat, 0.0), axis=1)
+            # z[k] = V[:,k]ᵀ V[:,i], masked to k < i.
+            z = tl.sum(Vmat * vi[:, None], axis=0)
+            z = tl.where(cols < i, z, 0.0)
+            # y[k] = sum_m T[k,m] z[m]  (T[0:i,0:i] @ z).
+            y = tl.sum(Tmat * z[None, :], axis=1)
+            taui = tl.sum(tl.where(cols == i, tau_acc, 0.0))
+            # column i of T: rows k<i -> -tau[i]*y[k]; row i -> tau[i]; else 0.
+            colT = tl.where(tw < i, -taui * y, tl.where(tw == i, taui, 0.0))
+            Tmat = tl.where(cols[None, :] == i, colT[:, None], Tmat)
+
+    tmask = (tw[:, None] < w) & (cols[None, :] < w)
+    tl.store(
+        T_ptr + pid * stride_Tb + tw[:, None] * stride_Ti + cols[None, :] * stride_Tj,
+        Tmat,
+        mask=tmask,
+    )
+
+
+def hh_panel_qr(panel: torch.Tensor):
+    """Fused Householder factorization of a batch of ``r x w`` panels + WY ``T``.
+
+    ``panel``: (B, r, w) contiguous float32 (r = remaining rows, w = panel
+    width). Returns ``(H, V, tau, T)`` where ``H`` (B, r, w) is the factored
+    panel in geqrf packing (R in the top ``w x w`` upper triangle, essential
+    reflectors below the diagonal), ``V`` (B, r, w) is the unit-lower reflector
+    matrix, ``tau`` (B, w) are the reflector coefficients, and ``T`` (B, w, w) is
+    the compact-WY (upper) block-reflector factor such that applying the panel's
+    ``Qᵀ`` to a trailing block ``C`` is ``C -= V @ (Tᵀ @ (Vᵀ @ C))``.
+    """
+    b, r, w = panel.shape
+    BLOCK_R = triton.next_power_of_2(r)
+    BLOCK_W = triton.next_power_of_2(w)
+    p = panel.contiguous()
+    H = torch.empty_like(p)
+    V = torch.empty_like(p)
+    tau = torch.empty(b, w, device=panel.device, dtype=panel.dtype)
+    T = torch.empty(b, w, w, device=panel.device, dtype=panel.dtype)
+    num_warps = 4 if BLOCK_R <= 128 else 8
+    grid = (b,)
+    _hh_panel_kernel[grid](
+        p,
+        H,
+        V,
+        tau,
+        T,
+        b,
+        r,
+        w,
+        p.stride(0),
+        p.stride(1),
+        p.stride(2),
+        H.stride(0),
+        H.stride(1),
+        H.stride(2),
+        V.stride(0),
+        V.stride(1),
+        V.stride(2),
+        tau.stride(0),
+        tau.stride(1),
+        T.stride(0),
+        T.stride(1),
+        T.stride(2),
+        num_warps=num_warps,
+        BLOCK_R=BLOCK_R,
+        BLOCK_W=BLOCK_W,
+    )
+    return H, V, tau, T

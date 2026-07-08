@@ -6,14 +6,21 @@ Variants are registered in ``VARIANTS`` and merged into the run registry.
 
 Which one is best?
 ------------------
-The **current champion is** ``hh_fused_smalln`` (marked by the module-level
-``CHAMPION`` constant): a fused single-block Householder QR (Triton) for
-``n<=128`` layered on top of ``cholqr3_shift_recon_repair2`` (which it calls
-unchanged for every larger shape). It has the best leaderboard geomean of the
-per-shape medians (~11.52 ms, ~3.7x vs the ``torch_geqrf`` baseline), improving
-on ``cholqr3_shift_recon_repair2`` (~12.43 ms) purely via the ~2.2x small-n
-(b20 n32) win. Use
-``python scripts/run_baseline.py --list`` to see every variant with its
+The **current champion is** ``hh_panel_gemm`` (marked by the module-level
+``CHAMPION`` constant): a **fused Householder panel + batched-GEMM trailing**
+blocked QR (Triton port of the NVIDIA seed's large-``n`` strategy). For every
+``n>128`` shape it factors each width-``w`` panel with a fully-fused per-matrix
+kernel (reusing the iteration-18 in-register Householder inner loop as
+``panel_core``, building the compact-WY ``T`` in-kernel) and applies the block
+reflector as batched GEMMs ``C -= V (Tᵀ (Vᵀ C))``; ``n<=128`` falls through to
+``hh_fused_smalln`` (fused small-``n`` kernel). Being **direct Householder**, it
+is unconditionally stable — no ``AᵀA`` conditioning, no modified-LU
+reconstruction, no shift/repair — and it is **dramatically faster** than the
+prior CholeskyQR champion on every large shape (b640 n512 ~58 -> ~7.8 ms,
+n1024 ~46 -> ~8.0, n2048 ~148 -> ~16, n4096 ~87 -> ~41), with *better* residuals.
+Leaderboard geomean of the per-shape medians ~3.01 ms (**~14.3x** vs the
+``torch_geqrf`` baseline), improving on ``hh_fused_smalln`` (~11.52 ms, 3.7x).
+Use ``python scripts/run_baseline.py --list`` to see every variant with its
 one-line description and status, and ``scripts/plot_results.py`` for the
 geomean leaderboard computed from ``db/``.
 
@@ -43,12 +50,21 @@ Lineage (how we got to the champion)
    refinement pass in the batched repair (``repair_passes`` 3 -> 2), which is
    still under every correctness gate but cheaper on the b640 n512 repair
    sub-batch. (Now the base engine wrapped by the champion for n>128.)
-7. ``hh_fused_smalln`` (**champion**) — a Triton port of the NVIDIA seed's
-   fully-fused per-matrix Householder QR (one program/matrix, whole matrix in
-   registers, geqrf packing, no library geqrf / trailing GEMM). Dispatches
-   ``n<=128`` to the fused kernel (~2.2x over geqrf on b20 n32) and everything
-   above to ``cholqr3_shift_recon_repair2`` unchanged. Foundational: de-risks
-   the in-register fused-Householder primitive for the larger panel + GEMM port.
+7. ``hh_fused_smalln`` — a Triton port of the NVIDIA seed's fully-fused
+   per-matrix Householder QR (one program/matrix, whole matrix in registers,
+   geqrf packing, no library geqrf / trailing GEMM). Dispatches ``n<=128`` to
+   the fused kernel (~2.2x over geqrf on b20 n32) and everything above to
+   ``cholqr3_shift_recon_repair2`` unchanged. Foundational: de-risked the
+   in-register fused-Householder primitive for the panel + GEMM port. Now the
+   ``n<=128`` sub-engine of the champion.
+8. ``hh_panel_gemm`` (**champion**) — the high-value panel port: for ``n>128``
+   factor each width-``w`` panel with the fused per-matrix kernel (reusing the
+   iteration-18 inner loop as ``panel_core`` and building the compact-WY ``T``
+   in-kernel), then apply the block reflector to the trailing matrix as batched
+   GEMMs. Direct Householder => unconditionally stable (no ``AᵀA`` conditioning /
+   reconstruction / shift-repair). Beats the CholeskyQR champion on **every**
+   large shape (geomean 11.52 -> ~3.01 ms, ~14.3x vs geqrf); ``n<=128`` still
+   uses ``hh_fused_smalln``.
 
 See ``LOG.md`` for the full per-iteration reasoning and measurements.
 """
@@ -73,7 +89,31 @@ QRImpl = Callable[..., tuple]
 
 # The single explicit "current best" marker. Kept in sync with LOG.md's active
 # best and the leaderboard geomean (see scripts/plot_results.py).
-CHAMPION = "hh_fused_smalln"
+CHAMPION = "hh_panel_gemm"
+
+_matmul_tf32_enabled: bool | None = None
+
+
+def _set_matmul_tf32(enabled: bool) -> None:
+    """Toggle TF32 for FP32 matmuls (batched GEMM trailing updates).
+
+    Cached so repeated calls are cheap. Used by the iteration-19 panel route to
+    pick the trailing-GEMM precision; the CholeskyQR path manages its own
+    precision and is unaffected (it resets the mode on entry).
+    """
+    global _matmul_tf32_enabled
+    if _matmul_tf32_enabled == enabled:
+        return
+    if torch is not None:
+        try:
+            torch.backends.cuda.matmul.fp32_precision = "tf32" if enabled else "ieee"
+        except Exception:  # noqa: BLE001 - older/newer torch API differences
+            pass
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = enabled
+        except Exception:  # noqa: BLE001
+            pass
+    _matmul_tf32_enabled = enabled
 
 
 def make_blocked_householder(block: int = 64) -> QRImpl:
@@ -704,6 +744,92 @@ def make_hh_fused_smalln(cap: int = 128, base: QRImpl | None = None) -> QRImpl:
     return impl
 
 
+def _hh_panel_blocked_qr(A: torch.Tensor, panel_w: int, tf32: bool):
+    """Blocked Householder QR via the fused Triton panel kernel + GEMM trailing.
+
+    Right-looking blocked QR (iteration 19 / NVIDIA-seed port): for each width-
+    ``panel_w`` panel of the trailing matrix, factor the ``r x w`` panel with the
+    fused Triton kernel (``hh_panel_qr``) — producing the reflectors ``V`` (unit
+    lower), ``tau`` and the compact-WY ``T`` — write the geqrf-packed panel into
+    ``H``, then apply the block reflector to the trailing submatrix as batched
+    GEMMs ``C -= V @ (Tᵀ @ (Vᵀ @ C))``. Returns geqrf-format ``(H, tau)``.
+
+    ``tf32`` selects the trailing GEMM precision (TF32 when True, IEEE FP32
+    otherwise). Being direct Householder, this is unconditionally stable — no
+    ``AᵀA`` conditioning, no reconstruction, no shift/repair.
+    """
+    from .triton_kernels import hh_panel_qr
+
+    batch, n, _ = A.shape
+    H = A.contiguous().clone()
+    tau = torch.empty(batch, n, device=A.device, dtype=A.dtype)
+    _set_matmul_tf32(tf32)
+    W = panel_w
+    for j0 in range(0, n, W):
+        w = min(W, n - j0)
+        panel = H[:, j0:, j0 : j0 + w].contiguous()
+        Hp, V, ptau, T = hh_panel_qr(panel)
+        H[:, j0:, j0 : j0 + w] = Hp
+        tau[:, j0 : j0 + w] = ptau
+        c = n - (j0 + w)
+        if c <= 0:
+            continue
+        C = H[:, j0:, j0 + w :]
+        # C -= V @ (Tᵀ @ (Vᵀ @ C))
+        W1 = torch.bmm(V.transpose(1, 2), C)
+        W2 = torch.bmm(T.transpose(1, 2), W1)
+        C.baddbmm_(V, W2, beta=1.0, alpha=-1.0)
+    return H, tau
+
+
+_PANEL_W_BY_N = {2048: 16, 4096: 16}  # narrower panels avoid register spill at big r
+_PANEL_W_DEFAULT = 32
+
+
+def _panel_width_for_n(n: int, width_by_n: dict[int, int], default_w: int) -> int:
+    return width_by_n.get(n, default_w)
+
+
+def make_hh_panel_gemm(
+    panel_min_n: int = 128,
+    width_by_n: dict[int, int] | None = None,
+    default_w: int = _PANEL_W_DEFAULT,
+    tf32: bool = False,
+    base: QRImpl | None = None,
+) -> QRImpl:
+    """Fused Householder panel + GEMM-trailing blocked QR (iteration 19).
+
+    Ports the NVIDIA winner's core large-``n`` strategy: a fully-fused per-matrix
+    Householder **panel** kernel (reusing the validated iteration-18 inner loop)
+    plus a batched-GEMM trailing update, building the compact-WY ``T`` in-kernel.
+    Unlike the CholeskyQR champion this route is unconditionally stable — no
+    ``AᵀA`` conditioning, no modified-LU reconstruction, no shift/repair — and it
+    measured **dramatically faster** on every large benchmark shape (b640 n512
+    ~58 -> ~7.8 ms, n1024 ~46 -> ~8.0 ms, n2048 ~148 -> ~16 ms).
+
+    Dispatch: ``n > panel_min_n`` uses the panel route with per-``n`` width
+    (``width_by_n``, default ``default_w``); ``n <= panel_min_n`` falls through to
+    ``base`` (the fused small-n / champion engine, which is faster for tiny n),
+    so no shape regresses. ``tf32`` selects the trailing-GEMM precision (IEEE FP32
+    measured as accurate *and* at least as fast on gfx950, so it is the default).
+    """
+    _base = base if base is not None else make_hh_fused_smalln(cap=128)
+    _width_by_n = dict(_PANEL_W_BY_N if width_by_n is None else width_by_n)
+
+    def impl(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        n = A.shape[-1]
+        if n > panel_min_n:
+            a = A if A.is_contiguous() else A.contiguous()
+            w = _panel_width_for_n(n, _width_by_n, default_w)
+            return _hh_panel_blocked_qr(a, w, tf32)
+        # Restore IEEE FP32 before the champion path so a prior panel call's TF32
+        # toggle never leaks into the CholeskyQR/geqrf shapes.
+        _set_matmul_tf32(False)
+        return _base(A)
+
+    return impl
+
+
 VARIANTS: dict[str, QRImpl] = {
     "blocked_hh_b64": make_blocked_householder(64),
     "cholqr2_recon": make_cholqr_recon(),
@@ -928,6 +1054,15 @@ VARIANTS: dict[str, QRImpl] = {
     # Foundational: validates the in-register fused-Householder primitive on
     # gfx950 that the iteration-19 panel + GEMM port will reuse. See LOG iter 18.
     "hh_fused_smalln": make_hh_fused_smalln(cap=128),
+    # Iteration 19: fused Householder PANEL + GEMM-trailing blocked QR (Triton
+    # port of the NVIDIA seed's large-n strategy). Factors each width-w panel
+    # with the fused per-matrix kernel (reusing the iteration-18 inner loop as
+    # panel_core), builds the compact-WY T in-kernel, and applies the block
+    # reflector to the trailing matrix as batched GEMMs. Direct Householder =>
+    # unconditionally stable (no A^T A conditioning / reconstruction / repair).
+    # ``panel_shapes`` gates which benchmark shapes use the panel route; the rest
+    # fall through to the champion so no shape can regress. See LOG iter 19.
+    "hh_panel_gemm": make_hh_panel_gemm(panel_min_n=128),
     "blocked_wy_b32": make_blocked_wy(32),
     "blocked_wy_b64": make_blocked_wy(64),
     "blocked_wy_b96": make_blocked_wy(96),
@@ -1005,11 +1140,15 @@ VARIANT_INFO: dict[str, VariantInfo] = {
         "killed",
     ),
     "cholqr3_shift_recon_repair2": VariantInfo(
-        "fusedasm + lighter batched repair; base engine for hh_fused_smalln (n>128)",
+        "CholeskyQR3+recon+repair; deep fallback engine under hh_fused_smalln",
         "active",
     ),
     "hh_fused_smalln": VariantInfo(
-        "fused single-block Householder QR (Triton) for n<=128; champion engine above",
+        "fused single-block Householder QR (Triton) for n<=128; champion's small-n engine",
+        "active",
+    ),
+    "hh_panel_gemm": VariantInfo(
+        "fused Householder panel (Triton) + batched-GEMM trailing; direct-HH, no repair",
         "active",
     ),
     "blocked_wy_b32": VariantInfo(
