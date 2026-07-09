@@ -19,6 +19,8 @@ Prose docs live under [`docs/`](docs/):
   its measurements, and the win/tie/lose/kill decisions, newest first.
 - [`docs/champion_kernel.md`](docs/champion_kernel.md) — teaching-style
   walkthrough of the current champion kernel (`hh_panel_tuned`).
+- [`docs/regime_guide.md`](docs/regime_guide.md) — user-facing guide to the
+  cond=1 performance regimes (with annotated heatmaps).
 
 ## Task in one paragraph
 

@@ -141,5 +141,6 @@ Boundary shapes (all must PASS):
 
 - Grid JSON: `db/grid_search_cond1_geqrf_vs_champion.json`
 - Heatmap: `plots/heatmap_champion_vs_geqrf_cond1.png`
+- Regime guide + annotated heatmaps: [`regime_guide.md`](regime_guide.md)
 - Prior profiling: `docs/hip_profiling/`
 - Profiling summaries (this iteration): `docs/regime_profiling/`

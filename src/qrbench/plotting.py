@@ -951,6 +951,253 @@ def _grid_row_speedup(row: dict) -> float:
     raise KeyError("grid row has no speedup or ratio_champion_over_torch")
 
 
+def _grid_speedup_matrix(grid_path: str | Path) -> tuple[dict, list[int], list[int], int, dict]:
+    """Load grid JSON and return speedup lookup + axis values + summary stats."""
+    import numpy as np
+
+    data = load_grid_search(grid_path)
+    batches = list(data["axes"]["batch"])
+    ns = list(data["axes"]["n"])
+    cond = int(data["axes"].get("cond", 1))
+    lookup: dict[tuple[int, int], float] = {}
+    for row in data["grid_results"]:
+        shape = row["shape"]
+        lookup[(int(shape["batch"]), int(shape["n"]))] = _grid_row_speedup(row)
+    matrix = np.full((len(ns), len(batches)), np.nan, dtype=float)
+    for yi, n in enumerate(ns):
+        for xi, b in enumerate(batches):
+            matrix[yi, xi] = lookup.get((b, n), np.nan)
+    return data, batches, ns, cond, lookup
+
+
+def _regime_plot_style() -> tuple[dict, list]:
+    """Distinct fill colors per regime + matplotlib legend handles."""
+    from matplotlib.patches import Patch
+
+    from qrbench.dispatch import REGIME_LEGEND_ORDER, REGIME_PREDICATES, Regime, regime_short
+
+    colors = {
+        Regime.R4_SMALLN: "#bdbdbd",
+        Regime.R1_MICRO: "#8ecae6",
+        Regime.R2_SWEET: "#e76f51",
+        Regime.R3_OCCUPANCY: "#f4d35e",
+        Regime.R5_LARGE_N_LARGE_B: "#9b5de5",
+        Regime.R6_TRANSITION: "#52b788",
+    }
+    patches = [
+        Patch(
+            facecolor=colors[r],
+            edgecolor="0.25",
+            linewidth=0.6,
+            label=f"{regime_short(r)}: {REGIME_PREDICATES[r]}",
+        )
+        for r in REGIME_LEGEND_ORDER
+    ]
+    return colors, patches
+
+
+def _draw_regime_cells(
+    ax,
+    batches: list[int],
+    ns: list[int],
+    lookup: dict[tuple[int, int], float],
+    *,
+    show_speedup: bool = True,
+    title: str,
+) -> None:
+    """Render an 8×8 regime map on ``ax`` (batch on x, n on y)."""
+    import numpy as np
+    from matplotlib.colors import ListedColormap
+
+    from qrbench.dispatch import REGIME_LEGEND_ORDER, Regime, regime_for, regime_short
+
+    colors, legend_patches = _regime_plot_style()
+    regime_idx = {r: i for i, r in enumerate(REGIME_LEGEND_ORDER)}
+    cmap = ListedColormap([colors[r] for r in REGIME_LEGEND_ORDER])
+
+    matrix = np.full((len(ns), len(batches)), np.nan, dtype=float)
+    for yi, n in enumerate(ns):
+        for xi, b in enumerate(batches):
+            matrix[yi, xi] = regime_idx[regime_for(b, n)]
+
+    ax.imshow(
+        matrix,
+        origin="lower",
+        aspect="auto",
+        cmap=cmap,
+        vmin=-0.5,
+        vmax=len(REGIME_LEGEND_ORDER) - 0.5,
+    )
+    ax.set_xticks(range(len(batches)))
+    ax.set_xticklabels([str(b) for b in batches])
+    ax.set_yticks(range(len(ns)))
+    ax.set_yticklabels([str(n) for n in ns])
+    ax.set_xlabel("batch size (b)")
+    ax.set_ylabel("matrix size (n)")
+    ax.set_title(title, fontsize=11)
+
+    for yi, n in enumerate(ns):
+        for xi, b in enumerate(batches):
+            regime = regime_for(b, n)
+            label = regime_short(regime)
+            if show_speedup:
+                speedup = lookup.get((b, n))
+                if speedup is not None and np.isfinite(speedup):
+                    sp = f"{speedup:.1f}x" if speedup >= 10 else f"{speedup:.2f}x"
+                    label = f"{label}\n{sp}"
+            # Pick text color from regime luminance (R2/R3 need dark text).
+            text_color = (
+                "black"
+                if regime in (Regime.R1_MICRO, Regime.R3_OCCUPANCY, Regime.R4_SMALLN)
+                else "white"
+            )
+            ax.text(
+                xi,
+                yi,
+                label,
+                ha="center",
+                va="center",
+                fontsize=6.5,
+                color=text_color,
+                linespacing=0.95,
+            )
+
+    ax.legend(
+        handles=legend_patches,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        fontsize=7,
+        title="regime (predicate)",
+        title_fontsize=8,
+        framealpha=0.95,
+    )
+
+
+def plot_regime_heatmap(
+    grid_path: str | Path,
+    out_path: str | Path,
+    *,
+    show_speedup: bool = True,
+) -> Path:
+    """Heatmap of performance regimes over the (batch, n) grid.
+
+    Each cell is filled by :func:`qrbench.dispatch.regime_for` with regime id
+    (and optional speedup) annotated. Writes ``plots/heatmap_regimes_cond1.png``
+    by convention.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    _data, batches, ns, cond, lookup = _grid_speedup_matrix(grid_path)
+    fig, ax = plt.subplots(figsize=(10.5, 7.0))
+    _draw_regime_cells(
+        ax,
+        batches,
+        ns,
+        lookup,
+        show_speedup=show_speedup,
+        title=f"Performance regimes (cond={cond})\n"
+        "colors = regime; labels = regime id + torch/champion speedup",
+    )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return out_path.resolve()
+
+
+def plot_speedup_and_regime_heatmap(
+    grid_path: str | Path,
+    out_path: str | Path,
+    *,
+    champion: str | None = None,
+    baseline: str = BASELINE_IMPL,
+) -> Path:
+    """Side-by-side speedup heatmap and regime map for the same grid."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import LogNorm
+
+    data, batches, ns, cond, lookup = _grid_speedup_matrix(grid_path)
+    champion = champion or data.get("champion", "hh_panel_tuned")
+
+    speedup = np.full((len(ns), len(batches)), np.nan, dtype=float)
+    for yi, n in enumerate(ns):
+        for xi, b in enumerate(batches):
+            speedup[yi, xi] = lookup.get((b, n), np.nan)
+
+    vmin = 1.0
+    hi = float(np.nanmax(speedup))
+    lo = float(np.nanmin(speedup))
+    vmax = max(300.0, hi * 1.05)
+    norm = LogNorm(vmin=vmin, vmax=vmax)
+
+    fig, (ax_speed, ax_regime) = plt.subplots(1, 2, figsize=(17.5, 7.0))
+
+    im = ax_speed.imshow(speedup, origin="lower", aspect="auto", cmap="coolwarm", norm=norm)
+    ax_speed.set_xticks(range(len(batches)))
+    ax_speed.set_xticklabels([str(b) for b in batches])
+    ax_speed.set_yticks(range(len(ns)))
+    ax_speed.set_yticklabels([str(n) for n in ns])
+    ax_speed.set_xlabel("batch size (b)")
+    ax_speed.set_ylabel("matrix size (n)")
+    cbar = fig.colorbar(im, ax=ax_speed, fraction=0.046, pad=0.04)
+    cbar.set_label("speedup = torch_median / champion_median  (>1 faster, log scale)")
+
+    log_lo = math.log10(max(lo, vmin))
+    log_hi = math.log10(max(hi, vmin * 1.001))
+    log_span = log_hi - log_lo
+    for yi, n in enumerate(ns):
+        for xi, b in enumerate(batches):
+            val = speedup[yi, xi]
+            if not np.isfinite(val):
+                continue
+            text = f"{val:.1f}x" if val >= 10 else f"{val:.2f}x"
+            if log_span > 0:
+                pos = (math.log10(max(val, vmin)) - log_lo) / log_span
+            else:
+                pos = 0.5
+            color = "white" if pos > 0.65 or pos < 0.15 else "black"
+            ax_speed.text(xi, yi, text, ha="center", va="center", fontsize=7, color=color)
+
+    summary = data.get("summary", {})
+    speedup_stats = summary.get("speedup_torch_over_champion", {})
+    ax_speed.set_title(
+        f"Speedup: {baseline} vs {champion} (cond={cond})\n"
+        f"min={speedup_stats.get('min', float('nan')):.2f}x  "
+        f"mean={speedup_stats.get('mean', float('nan')):.2f}x  "
+        f"max={speedup_stats.get('max', float('nan')):.1f}x",
+        fontsize=11,
+    )
+
+    _draw_regime_cells(
+        ax_regime,
+        batches,
+        ns,
+        lookup,
+        show_speedup=False,
+        title=f"Regime map (cond={cond})\ncell label = regime id",
+    )
+
+    fig.suptitle(
+        "Grid search: champion speedup and performance regimes",
+        fontsize=13,
+        y=1.02,
+    )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return out_path.resolve()
+
+
 def plot_grid_heatmap(
     grid_path: str | Path,
     out_path: str | Path,
