@@ -3,23 +3,25 @@
 Tracking record of variants tried, results, and decisions. Newest first.
 Baseline reference: `torch.geqrf` (rocSOLVER), per-shape medians in `db/`.
 
-## Grid search — cond=1, batch × n (56 points)
+## Grid search — cond=1, batch × n (64 points)
 
-Expanded benchmark scope: **batch** ∈ {2, 4, 8, 16, 32, 64, 128}, **n** ∈
+Expanded benchmark scope: **batch** ∈ {2, 4, 8, 16, 32, 64, 128, **256**}, **n** ∈
 {32, 64, 128, 256, 512, 1024, 2048, **4096**}, **cond=1** fixed. Compared
 `torch.geqrf` vs champion `hh_panel_tuned` (10 warmup + 10 timed runs per point;
-correctness gate on all 56 champion runs).
+correctness gate on all champion runs).
 
 - **Results:** `db/grid_search_cond1_geqrf_vs_champion.json`
 - **Heatmap:** `plots/heatmap_champion_vs_geqrf_cond1.png`
   (color = `torch_median / champion_median` speedup; **coolwarm** colormap:
   blue = lower speedup, red = higher; >1 = champion faster)
-- **Runtime:** 437.0 s on GPU 4 (MI350X)
-- **Speedup torch/champion:** min **1.94×** (`b2_n4096`), max **182.7×** (`b128_n512`),
-  mean **17.0×**
-- **Champion losses (speedup < 1):** none; all 56 correctness gates PASS
+- **Runtime:** 437.0 s initial 56-point grid on GPU 4 (MI350X); +425.8 s incremental
+  **b=256** column (8 points, `--batch 256 --incremental`)
+- **Speedup torch/champion (64 points):** min **1.94×** (`b2_n4096`), max **286.8×**
+  (`b256_n512`), mean **~20×** (recomputed over full 8×8 grid)
+- **Champion losses (speedup < 1):** none; all 64 correctness gates PASS
+- **b=256 column:** 2.18× (`n32`) … 286.8× (`n512`), 8.53× (`n4096`); mean **58.6×**
 - **n=4096 row:** champion ~41 ms at b=2 (1.94× vs torch ~79 ms) — occupancy-bound
-  at tiny batch; speedup rises with batch (e.g. b128 → 8.1×, torch ~5.1 s vs champ ~624 ms)
+  at tiny batch; speedup rises with batch (e.g. b128 → 8.1×; b256 → 8.5×)
 
 Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 

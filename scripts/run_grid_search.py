@@ -4,8 +4,11 @@
 Usage (inside the ROCm container):
     python scripts/run_grid_search.py
     python scripts/run_grid_search.py --warmup 10 --iters 10
+    python scripts/run_grid_search.py --batch 256 --incremental
 
 Writes ``db/grid_search_cond1_geqrf_vs_champion.json`` and prints summary stats.
+With ``--incremental``, new points are merged into the existing file (same
+(batch, n) keys are replaced; other points preserved).
 """
 
 from __future__ import annotations
@@ -28,15 +31,49 @@ from qrbench.variants import CHAMPION, VARIANTS  # noqa: E402
 BASELINE = "torch_geqrf"
 CHAMPION_IMPL = CHAMPION
 
-GRID_BATCH = [2, 4, 8, 16, 32, 64, 128]
+GRID_BATCH = [2, 4, 8, 16, 32, 64, 128, 256]
 GRID_N = [32, 64, 128, 256, 512, 1024, 2048, 4096]
 GRID_COND = 1
 
 DEFAULT_OUT = REPO_ROOT / "db" / "grid_search_cond1_geqrf_vs_champion.json"
 
 
-def grid_shapes() -> list[dict]:
-    return [{"batch": b, "n": n, "cond": GRID_COND} for b in GRID_BATCH for n in GRID_N]
+def grid_shapes(
+    batches: list[int] | None = None,
+    ns: list[int] | None = None,
+) -> list[dict]:
+    batches = batches if batches is not None else GRID_BATCH
+    ns = ns if ns is not None else GRID_N
+    return [{"batch": b, "n": n, "cond": GRID_COND} for b in batches for n in ns]
+
+
+def _shape_key(shape: dict) -> tuple[int, int, int]:
+    return (int(shape["batch"]), int(shape["n"]), int(shape.get("cond", GRID_COND)))
+
+
+def merge_grid_results(existing: list[dict], new: list[dict]) -> list[dict]:
+    """Replace matching (batch, n, cond) rows; keep all others."""
+    by_key = {_shape_key(r["shape"]): r for r in existing}
+    for row in new:
+        by_key[_shape_key(row["shape"])] = row
+    batches = sorted({int(r["shape"]["batch"]) for r in by_key.values()})
+    ns = sorted({int(r["shape"]["n"]) for r in by_key.values()})
+    ordered: list[dict] = []
+    for b in batches:
+        for n in ns:
+            key = (b, n, GRID_COND)
+            if key in by_key:
+                ordered.append(by_key[key])
+    return ordered
+
+
+def load_existing_grid(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text())
+    if data.get("kind") != "grid_search":
+        raise ValueError(f"not a grid_search file: {path}")
+    return data
 
 
 def benchmark_point(
@@ -129,6 +166,27 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--docker-image", default=None)
     ap.add_argument("--out", default=str(DEFAULT_OUT))
+    ap.add_argument(
+        "--batch",
+        type=int,
+        action="append",
+        dest="batches",
+        metavar="B",
+        help="run only these batch sizes (repeatable; default: full GRID_BATCH)",
+    )
+    ap.add_argument(
+        "--n",
+        type=int,
+        action="append",
+        dest="ns",
+        metavar="N",
+        help="run only these n values (repeatable; default: full GRID_N)",
+    )
+    ap.add_argument(
+        "--incremental",
+        action="store_true",
+        help="merge new points into existing output JSON instead of replacing it",
+    )
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -138,10 +196,16 @@ def main() -> int:
     torch_fn = REF_REGISTRY[BASELINE]
     champion_fn = VARIANTS[CHAMPION_IMPL]
 
-    print(
-        f"grid search cond={GRID_COND}  "
-        f"batch={GRID_BATCH}  n={GRID_N}  ({len(GRID_BATCH) * len(GRID_N)} points)"
-    )
+    run_batches = args.batches if args.batches else GRID_BATCH
+    run_ns = args.ns if args.ns else GRID_N
+    shapes = grid_shapes(run_batches, run_ns)
+    out_path = Path(args.out)
+    existing = load_existing_grid(out_path) if args.incremental else None
+    prior_results = existing["grid_results"] if existing else []
+
+    print(f"grid search cond={GRID_COND}  batch={run_batches}  n={run_ns}  ({len(shapes)} points)")
+    if args.incremental:
+        print(f"incremental merge into {out_path} ({len(prior_results)} existing points)")
     print(
         f"baseline={BASELINE}  champion={CHAMPION_IMPL}  "
         f"device={torch.cuda.get_device_name(0)}  "
@@ -150,12 +214,23 @@ def main() -> int:
     print(f"warmup={args.warmup}  iters={args.iters}\n")
 
     t0 = time.perf_counter()
-    results = []
-    for shape in grid_shapes():
-        results.append(
+    new_results = []
+    for shape in shapes:
+        new_results.append(
             benchmark_point(shape, torch_fn, champion_fn, args.device, args.warmup, args.iters)
         )
     elapsed = time.perf_counter() - t0
+
+    if args.incremental and prior_results:
+        results = merge_grid_results(prior_results, new_results)
+        print(
+            f"\nmerged {len(new_results)} new + {len(prior_results)} existing -> {len(results)} total"
+        )
+    else:
+        results = new_results
+
+    merged_batches = sorted({int(r["shape"]["batch"]) for r in results})
+    merged_ns = sorted({int(r["shape"]["n"]) for r in results})
 
     summary = summarize(results)
     meta = dbwrite.collect_metadata(str(REPO_ROOT), args.docker_image)
@@ -166,15 +241,17 @@ def main() -> int:
         "baseline": BASELINE,
         "champion": CHAMPION_IMPL,
         **meta,
-        "axes": {"batch": GRID_BATCH, "n": GRID_N, "cond": GRID_COND},
+        "axes": {"batch": merged_batches, "n": merged_ns, "cond": GRID_COND},
         "warmup": args.warmup,
         "iters": args.iters,
         "grid_results": results,
         "summary": summary,
         "runtime_seconds": elapsed,
     }
+    if existing and args.incremental:
+        payload["incremental_runtime_seconds"] = elapsed
+        payload["runtime_seconds"] = existing.get("runtime_seconds", 0) + elapsed
 
-    out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2))
     print(f"\nwrote {out_path}")

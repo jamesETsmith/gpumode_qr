@@ -68,8 +68,60 @@ def _l1(x: torch.Tensor) -> torch.Tensor:
     return torch.linalg.matrix_norm(x, ord=1)
 
 
+def _auto_batch_chunk(batch: int, n: int, max_bytes: int = 2_000_000_000) -> int:
+    """Chunk size so fp64 Q/QtA workspace stays under ``max_bytes`` per slice."""
+    per_item = 4 * n * n * 8  # A, Q, QtA, R in fp64
+    if per_item <= 0:
+        return batch
+    return max(1, min(batch, max_bytes // per_item))
+
+
 def check(A: torch.Tensor, H: torch.Tensor, tau: torch.Tensor) -> CheckResult:
     """Validate a compact (H, tau) factorization of A. Residuals in FP64."""
+    n = A.shape[-1]
+    batch = A.shape[0]
+    factor_thr = 20.0 * n * EPS32
+    orth_thr = 100.0 * n * EPS32
+    eye = torch.eye(n, device=A.device, dtype=torch.float64)
+
+    chunk = _auto_batch_chunk(batch, n)
+    if chunk >= batch:
+        return _check_slice(A, H, tau, eye, factor_thr, orth_thr)
+
+    factor_rel = 0.0
+    orth_res = 0.0
+    leakage = 0.0
+    recon = 0.0
+    for start in range(0, batch, chunk):
+        end = min(start + chunk, batch)
+        sub = _check_slice(A[start:end], H[start:end], tau[start:end], eye, factor_thr, orth_thr)
+        factor_rel = max(factor_rel, sub.factor_residual)
+        orth_res = max(orth_res, sub.orth_residual)
+        leakage = max(leakage, sub.leakage)
+        recon = max(recon, sub.reconstruction)
+
+    return CheckResult(
+        n=n,
+        batch=batch,
+        factor_residual=factor_rel,
+        factor_threshold=factor_thr,
+        factor_pass=factor_rel <= factor_thr,
+        orth_residual=orth_res,
+        orth_threshold=orth_thr,
+        orth_pass=orth_res <= orth_thr,
+        leakage=leakage,
+        reconstruction=recon,
+    )
+
+
+def _check_slice(
+    A: torch.Tensor,
+    H: torch.Tensor,
+    tau: torch.Tensor,
+    eye: torch.Tensor,
+    factor_thr: float,
+    orth_thr: float,
+) -> CheckResult:
     n = A.shape[-1]
     batch = A.shape[0]
 
@@ -83,12 +135,9 @@ def check(A: torch.Tensor, H: torch.Tensor, tau: torch.Tensor) -> CheckResult:
     factor_res = _l1(R - QtA)
     a_norm = _l1(A64).clamp_min(torch.finfo(torch.float64).tiny)
     factor_rel = (factor_res / a_norm).max().item()
-    factor_thr = 20.0 * n * EPS32
 
     # orthogonality: Q.T @ Q - I, ||I||_1 = 1
-    eye = torch.eye(n, device=A.device, dtype=torch.float64)
     orth_res = _l1(Q.transpose(-2, -1) @ Q - eye).max().item()
-    orth_thr = 100.0 * n * EPS32
 
     # diagnostics
     tril = torch.tril(QtA, diagonal=-1)
