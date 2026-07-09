@@ -12,11 +12,11 @@ correctness gate on all 49 champion runs).
 
 - **Results:** `db/grid_search_cond1_geqrf_vs_champion.json`
 - **Heatmap:** `plots/heatmap_champion_vs_geqrf_cond1.png`
-  (color = `champion_median / torch_median`; <1 = champion faster)
+  (color = `torch_median / champion_median` speedup; >1 = champion faster)
 - **Runtime:** 189.5 s on GPU 4 (MI350X)
-- **Ratio champion/torch:** min **0.005** (`b128_n512`), max **0.464** (`b2_n32`),
-  mean **0.238**; speedup range **2.2×–182×**
-- **Champion losses (ratio > 1):** none; all 49 correctness gates PASS
+- **Speedup torch/champion:** min **2.2×** (`b2_n32`), max **182×** (`b128_n512`),
+  mean **17.6×**
+- **Champion losses (speedup < 1):** none; all 49 correctness gates PASS
 
 Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 

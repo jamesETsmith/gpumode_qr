@@ -78,6 +78,7 @@ def benchmark_point(
         },
         "ratio_champion_over_torch": ratio,
         "speedup_torch_over_champion": torch_timing.median / champ_timing.median,
+        "speedup": torch_timing.median / champ_timing.median,
     }
 
 

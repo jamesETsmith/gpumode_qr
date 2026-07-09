@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Plot a grid-search heatmap from ``db/grid_search_cond1_geqrf_vs_champion.json``.
+"""Plot a grid-search speedup heatmap (torch/champion) from grid-search JSON.
 
 Runs on the host (no GPU / torch required):
 

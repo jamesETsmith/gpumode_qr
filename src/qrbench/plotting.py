@@ -938,6 +938,19 @@ def load_grid_search(path: str | Path) -> dict:
     return data
 
 
+def _grid_row_speedup(row: dict) -> float:
+    """Torch-over-champion median speedup from a grid-search result row."""
+    for key in ("speedup", "speedup_torch_over_champion"):
+        if key in row:
+            return float(row[key])
+    ratio = row.get("ratio_champion_over_torch")
+    if ratio is not None:
+        ratio = float(ratio)
+        if ratio > 0:
+            return 1.0 / ratio
+    raise KeyError("grid row has no speedup or ratio_champion_over_torch")
+
+
 def plot_grid_heatmap(
     grid_path: str | Path,
     out_path: str | Path,
@@ -945,12 +958,10 @@ def plot_grid_heatmap(
     champion: str | None = None,
     baseline: str = BASELINE_IMPL,
 ) -> Path:
-    """Heatmap of champion/torch median ratio over (batch, n) grid points.
+    """Heatmap of torch/champion median speedup over (batch, n) grid points.
 
-    Color encodes ``ratio = champion_median_ms / torch_median_ms``:
-    values < 1 mean the champion is faster (shown greener/darker in ``RdYlGn_r``).
-    The colorbar is labeled with this formula; speedup ``torch/champion`` is the
-    reciprocal.
+    Color encodes ``speedup = torch_median_ms / champion_median_ms``:
+    values > 1 mean the champion is faster (greener in ``RdYlGn``).
     """
     import matplotlib
 
@@ -967,21 +978,22 @@ def plot_grid_heatmap(
     lookup: dict[tuple[int, int], float] = {}
     for row in data["grid_results"]:
         shape = row["shape"]
-        lookup[(int(shape["batch"]), int(shape["n"]))] = float(row["ratio_champion_over_torch"])
+        lookup[(int(shape["batch"]), int(shape["n"]))] = _grid_row_speedup(row)
 
     matrix = np.full((len(ns), len(batches)), np.nan, dtype=float)
     for yi, n in enumerate(ns):
         for xi, b in enumerate(batches):
             matrix[yi, xi] = lookup.get((b, n), np.nan)
 
+    vmax = max(2.0, float(np.nanmax(matrix)) * 1.05)
     fig, ax = plt.subplots(figsize=(9.5, 7.0))
     im = ax.imshow(
         matrix,
         origin="lower",
         aspect="auto",
-        cmap="RdYlGn_r",
-        vmin=0.0,
-        vmax=max(1.0, float(np.nanmax(matrix)) * 1.05),
+        cmap="RdYlGn",
+        vmin=1.0,
+        vmax=vmax,
     )
     ax.set_xticks(range(len(batches)))
     ax.set_xticklabels([str(b) for b in batches])
@@ -990,30 +1002,39 @@ def plot_grid_heatmap(
     ax.set_xlabel("batch size (b)")
     ax.set_ylabel("matrix size (n)")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("ratio = champion_median / torch_median  (<1 faster)")
+    cbar.set_label("speedup = torch_median / champion_median  (>1 faster)")
 
-    # annotate each cell with ratio (and speedup when champion wins)
+    hi = float(np.nanmax(matrix))
+    lo = float(np.nanmin(matrix))
     for yi, n in enumerate(ns):
         for xi, b in enumerate(batches):
             val = matrix[yi, xi]
             if not np.isfinite(val):
                 continue
-            text = f"{val:.2f}"
-            if val < 1.0 and val > 0:
-                text += f"\n{1.0 / val:.1f}x"
-            color = "white" if val < 0.35 or val > 0.85 else "black"
+            text = f"{val:.1f}x" if val >= 10 else f"{val:.2f}x"
+            color = "white" if val > 0.65 * hi or val < lo + 0.15 * (hi - lo) else "black"
             ax.text(xi, yi, text, ha="center", va="center", fontsize=7, color=color)
 
     summary = data.get("summary", {})
-    ratio_stats = summary.get("ratio_champion_over_torch", {})
+    speedup_stats = summary.get("speedup_torch_over_champion", {})
+    if not speedup_stats:
+        ratio_stats = summary.get("ratio_champion_over_torch", {})
+        rmin = ratio_stats.get("min")
+        rmax = ratio_stats.get("max")
+        if rmin and rmax and float(rmin) > 0 and float(rmax) > 0:
+            speedup_stats = {
+                "min": 1.0 / float(rmax),
+                "max": 1.0 / float(rmin),
+                "mean": float(np.nanmean(matrix)),
+            }
     subtitle = (
         f"cond={cond}  |  {baseline} vs {champion}  |  "
-        f"ratio min={ratio_stats.get('min', float('nan')):.3f}  "
-        f"mean={ratio_stats.get('mean', float('nan')):.3f}  "
-        f"max={ratio_stats.get('max', float('nan')):.3f}"
+        f"speedup min={speedup_stats.get('min', float('nan')):.2f}x  "
+        f"mean={speedup_stats.get('mean', float('nan')):.2f}x  "
+        f"max={speedup_stats.get('max', float('nan')):.1f}x"
     )
     ax.set_title(
-        "Grid search: champion vs torch.geqrf median runtime ratio\n" + subtitle,
+        "Grid search: champion speedup vs torch.geqrf (torch / champion median)\n" + subtitle,
         fontsize=11,
     )
     fig.tight_layout()
