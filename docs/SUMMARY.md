@@ -32,7 +32,7 @@ leaderboard, `--list`/`--compare` commands with an explicit champion, a
 cond=1 **8×8 grid search** (`scripts/run_grid_search.py`; `--batch` /
 `--incremental` for partial updates) with heatmap
 (`plots/heatmap_champion_vs_geqrf_cond1.png`; speedup = torch/champion,
-**coolwarm** blue→red colormap, all 64 points PASS, 1.9×–287× speedup), a full-history secret audit (clean), and
+**coolwarm** blue→red colormap, **log-scale** colorbar, all 64 points PASS, 1.9×–287× speedup), a full-history secret audit (clean), and
 pre-commit hooks (gitleaks, ruff, standard hygiene, and a custom AGENTS.md
 no-node/network/firmware check).
 

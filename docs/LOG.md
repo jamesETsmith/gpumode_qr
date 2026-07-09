@@ -12,7 +12,7 @@ correctness gate on all champion runs).
 
 - **Results:** `db/grid_search_cond1_geqrf_vs_champion.json`
 - **Heatmap:** `plots/heatmap_champion_vs_geqrf_cond1.png`
-  (color = `torch_median / champion_median` speedup; **coolwarm** colormap:
+  (color = `torch_median / champion_median` speedup on a **log** scale; **coolwarm** colormap:
   blue = lower speedup, red = higher; >1 = champion faster)
 - **Runtime:** 437.0 s initial 56-point grid on GPU 4 (MI350X); +425.8 s incremental
   **b=256** column (8 points, `--batch 256 --incremental`)

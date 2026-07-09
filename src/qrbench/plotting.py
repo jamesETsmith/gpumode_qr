@@ -960,15 +960,16 @@ def plot_grid_heatmap(
 ) -> Path:
     """Heatmap of torch/champion median speedup over (batch, n) grid points.
 
-    Color encodes ``speedup = torch_median_ms / champion_median_ms``:
-    values > 1 mean the champion is faster. Uses ``coolwarm`` (blue = lower
-    speedup near 1×, red = higher speedup).
+    Color encodes ``speedup = torch_median_ms / champion_median_ms`` on a log
+    scale. Values > 1 mean the champion is faster. Uses ``coolwarm`` (blue =
+    lower speedup near 1×, red = higher speedup).
     """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import numpy as np
+    from matplotlib.colors import LogNorm
 
     data = load_grid_search(grid_path)
     champion = champion or data.get("champion", "hh_panel_tuned")
@@ -986,15 +987,18 @@ def plot_grid_heatmap(
         for xi, b in enumerate(batches):
             matrix[yi, xi] = lookup.get((b, n), np.nan)
 
-    vmax = max(2.0, float(np.nanmax(matrix)) * 1.05)
+    vmin = 1.0
+    hi = float(np.nanmax(matrix))
+    lo = float(np.nanmin(matrix))
+    vmax = max(300.0, hi * 1.05)
+    norm = LogNorm(vmin=vmin, vmax=vmax)
     fig, ax = plt.subplots(figsize=(9.5, 7.0))
     im = ax.imshow(
         matrix,
         origin="lower",
         aspect="auto",
         cmap="coolwarm",
-        vmin=1.0,
-        vmax=vmax,
+        norm=norm,
     )
     ax.set_xticks(range(len(batches)))
     ax.set_xticklabels([str(b) for b in batches])
@@ -1003,17 +1007,29 @@ def plot_grid_heatmap(
     ax.set_xlabel("batch size (b)")
     ax.set_ylabel("matrix size (n)")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("speedup = torch_median / champion_median  (>1 faster)")
+    cbar.set_label("speedup = torch_median / champion_median  (>1 faster, log scale)")
+    tick_candidates = [1, 2, 5, 10, 50, 100, 300]
+    cbar_ticks = [t for t in tick_candidates if vmin <= t <= vmax]
+    if hi > 0 and all(abs(t - hi) / hi > 0.05 for t in cbar_ticks):
+        cbar_ticks.append(hi)
+        cbar_ticks = sorted(set(cbar_ticks))
+    cbar.set_ticks(cbar_ticks)
+    cbar.set_ticklabels([f"{t:g}" for t in cbar_ticks])
 
-    hi = float(np.nanmax(matrix))
-    lo = float(np.nanmin(matrix))
+    log_lo = math.log10(max(lo, vmin))
+    log_hi = math.log10(max(hi, vmin * 1.001))
+    log_span = log_hi - log_lo
     for yi, n in enumerate(ns):
         for xi, b in enumerate(batches):
             val = matrix[yi, xi]
             if not np.isfinite(val):
                 continue
             text = f"{val:.1f}x" if val >= 10 else f"{val:.2f}x"
-            color = "white" if val > 0.65 * hi or val < lo + 0.15 * (hi - lo) else "black"
+            if log_span > 0:
+                pos = (math.log10(max(val, vmin)) - log_lo) / log_span
+            else:
+                pos = 0.5
+            color = "white" if pos > 0.65 or pos < 0.15 else "black"
             ax.text(xi, yi, text, ha="center", va="center", fontsize=7, color=color)
 
     summary = data.get("summary", {})
