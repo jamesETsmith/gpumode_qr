@@ -961,7 +961,8 @@ def plot_grid_heatmap(
     """Heatmap of torch/champion median speedup over (batch, n) grid points.
 
     Color encodes ``speedup = torch_median_ms / champion_median_ms``:
-    values > 1 mean the champion is faster (greener in ``RdYlGn``).
+    values > 1 mean the champion is faster. Uses ``coolwarm`` (blue = lower
+    speedup near 1×, red = higher speedup).
     """
     import matplotlib
 
@@ -991,7 +992,7 @@ def plot_grid_heatmap(
         matrix,
         origin="lower",
         aspect="auto",
-        cmap="RdYlGn",
+        cmap="coolwarm",
         vmin=1.0,
         vmax=vmax,
     )

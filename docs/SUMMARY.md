@@ -29,9 +29,9 @@ The remaining `n2048`/`n4096` cost is occupancy-bound (batch 8/2). Converged.
 
 **Tooling & hygiene.** Per-shape and geomean-over-iteration plots, a variant
 leaderboard, `--list`/`--compare` commands with an explicit champion, a
-cond=1 **7×7 grid search** (`scripts/run_grid_search.py`) with heatmap
-(`plots/heatmap_champion_vs_geqrf_cond1.png`; speedup = torch/champion, all 49
-points PASS, 2.2×–182× speedup), a full-history secret audit (clean), and
+cond=1 **7×8 grid search** (`scripts/run_grid_search.py`) with heatmap
+(`plots/heatmap_champion_vs_geqrf_cond1.png`; speedup = torch/champion,
+**coolwarm** blue→red colormap, all 56 points PASS, 1.9×–183× speedup), a full-history secret audit (clean), and
 pre-commit hooks (gitleaks, ruff, standard hygiene, and a custom AGENTS.md
 no-node/network/firmware check).
 
