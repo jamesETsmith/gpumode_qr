@@ -3,6 +3,21 @@
 Tracking record of variants tried, results, and decisions. Newest first.
 Baseline reference: `torch.geqrf` (rocSOLVER), per-shape medians in `db/`.
 
+## Grid search — cond=1, batch × n (49 points)
+
+Expanded benchmark scope: **batch** ∈ {2, 4, 8, 16, 32, 64, 128}, **n** ∈
+{32, 64, 128, 256, 512, 1024, 2048}, **cond=1** fixed. Compared
+`torch.geqrf` vs champion `hh_panel_tuned` (10 warmup + 10 timed runs per point;
+correctness gate on all 49 champion runs).
+
+- **Results:** `db/grid_search_cond1_geqrf_vs_champion.json`
+- **Heatmap:** `plots/heatmap_champion_vs_geqrf_cond1.png`
+  (color = `champion_median / torch_median`; <1 = champion faster)
+- **Runtime:** 189.5 s on GPU 4 (MI350X)
+- **Ratio champion/torch:** min **0.005** (`b128_n512`), max **0.464** (`b2_n32`),
+  mean **0.238**; speedup range **2.2×–182×**
+- **Champion losses (ratio > 1):** none; all 49 correctness gates PASS
+
 Baseline medians (ms), 10 runs, MI350X / ROCm 7.2.4:
 
 | shape           |    n | batch | torch.geqrf |

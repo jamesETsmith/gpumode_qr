@@ -930,6 +930,100 @@ def plot_geomean_over_iterations(runs: list[Run], out_path: Path) -> Path:
     return out_path.resolve()
 
 
+def load_grid_search(path: str | Path) -> dict:
+    """Load a grid-search JSON produced by ``scripts/run_grid_search.py``."""
+    data = json.loads(Path(path).read_text())
+    if data.get("kind") != "grid_search":
+        raise ValueError(f"not a grid_search file: {path}")
+    return data
+
+
+def plot_grid_heatmap(
+    grid_path: str | Path,
+    out_path: str | Path,
+    *,
+    champion: str | None = None,
+    baseline: str = BASELINE_IMPL,
+) -> Path:
+    """Heatmap of champion/torch median ratio over (batch, n) grid points.
+
+    Color encodes ``ratio = champion_median_ms / torch_median_ms``:
+    values < 1 mean the champion is faster (shown greener/darker in ``RdYlGn_r``).
+    The colorbar is labeled with this formula; speedup ``torch/champion`` is the
+    reciprocal.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    data = load_grid_search(grid_path)
+    champion = champion or data.get("champion", "hh_panel_tuned")
+    batches = list(data["axes"]["batch"])
+    ns = list(data["axes"]["n"])
+    cond = data["axes"].get("cond", 1)
+
+    lookup: dict[tuple[int, int], float] = {}
+    for row in data["grid_results"]:
+        shape = row["shape"]
+        lookup[(int(shape["batch"]), int(shape["n"]))] = float(row["ratio_champion_over_torch"])
+
+    matrix = np.full((len(ns), len(batches)), np.nan, dtype=float)
+    for yi, n in enumerate(ns):
+        for xi, b in enumerate(batches):
+            matrix[yi, xi] = lookup.get((b, n), np.nan)
+
+    fig, ax = plt.subplots(figsize=(9.5, 7.0))
+    im = ax.imshow(
+        matrix,
+        origin="lower",
+        aspect="auto",
+        cmap="RdYlGn_r",
+        vmin=0.0,
+        vmax=max(1.0, float(np.nanmax(matrix)) * 1.05),
+    )
+    ax.set_xticks(range(len(batches)))
+    ax.set_xticklabels([str(b) for b in batches])
+    ax.set_yticks(range(len(ns)))
+    ax.set_yticklabels([str(n) for n in ns])
+    ax.set_xlabel("batch size (b)")
+    ax.set_ylabel("matrix size (n)")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("ratio = champion_median / torch_median  (<1 faster)")
+
+    # annotate each cell with ratio (and speedup when champion wins)
+    for yi, n in enumerate(ns):
+        for xi, b in enumerate(batches):
+            val = matrix[yi, xi]
+            if not np.isfinite(val):
+                continue
+            text = f"{val:.2f}"
+            if val < 1.0 and val > 0:
+                text += f"\n{1.0 / val:.1f}x"
+            color = "white" if val < 0.35 or val > 0.85 else "black"
+            ax.text(xi, yi, text, ha="center", va="center", fontsize=7, color=color)
+
+    summary = data.get("summary", {})
+    ratio_stats = summary.get("ratio_champion_over_torch", {})
+    subtitle = (
+        f"cond={cond}  |  {baseline} vs {champion}  |  "
+        f"ratio min={ratio_stats.get('min', float('nan')):.3f}  "
+        f"mean={ratio_stats.get('mean', float('nan')):.3f}  "
+        f"max={ratio_stats.get('max', float('nan')):.3f}"
+    )
+    ax.set_title(
+        "Grid search: champion vs torch.geqrf median runtime ratio\n" + subtitle,
+        fontsize=11,
+    )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+    return out_path.resolve()
+
+
 def generate_all(repo: str | Path) -> list[Path]:
     """Load data + git history and write both figures under ``<repo>/plots``.
 
